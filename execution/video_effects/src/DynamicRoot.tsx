@@ -1,31 +1,22 @@
-import React from "react";
-import {
-  Composition,
-  AbsoluteFill,
-  Img,
-  interpolate,
-  useCurrentFrame,
-  useVideoConfig,
-  staticFile,
-} from "remotion";
 
-// This file is dynamically overwritten by pan_3d_transition.py
-// with the correct frame count, dimensions, and effect parameters.
-// The version below is a placeholder for development/studio use.
+import React from "react";
+import { Composition, AbsoluteFill, Img, interpolate, useCurrentFrame, useVideoConfig, Easing, staticFile } from "remotion";
 
 const VideoTransition3D: React.FC = () => {
   const frame = useCurrentFrame();
-  const { durationInFrames } = useVideoConfig();
+  const { durationInFrames, fps } = useVideoConfig();
 
-  const frameCount = 300;
+  const frameCount = 149;
+  const playbackRate = 1;
   const swivelStart = 3.5;
   const swivelEnd = -3.5;
   const tiltStart = 1.7;
   const tiltEnd = 1.7;
   const perspectiveVal = 1000;
 
-  const sourceFrameIndex = Math.min(Math.floor(frame), frameCount - 1);
+  const sourceFrameIndex = Math.min(Math.floor(frame * playbackRate), frameCount - 1);
 
+  // Progress for 3D effect
   const progress = interpolate(frame, [0, durationInFrames], [0, 1], {
     extrapolateRight: "clamp",
   });
@@ -33,23 +24,18 @@ const VideoTransition3D: React.FC = () => {
   const swivelDeg = interpolate(progress, [0, 1], [swivelStart, swivelEnd]);
   const tiltDeg = interpolate(progress, [0, 1], [tiltStart, tiltEnd]);
   const scaleVal = 0.985;
+  const translateY = 0;
 
   const frameNum = String(sourceFrameIndex + 1).padStart(4, "0");
   const frameFilename = "frame_" + frameNum + ".jpg";
 
   return (
-    <AbsoluteFill
-      style={{
-        perspective: perspectiveVal + "px",
-        backgroundColor: "#2d3436",
-      }}
-    >
-      <AbsoluteFill
-        style={{
-          transform: `rotateY(${swivelDeg}deg) rotateX(${tiltDeg}deg) scale(${scaleVal})`,
-          transformStyle: "preserve-3d",
-        }}
-      >
+    <AbsoluteFill style={{ perspective: perspectiveVal + "px", backgroundColor: "#2d3436" }}>
+      
+      <AbsoluteFill style={{
+        transform: "translateY(" + translateY + "%) rotateY(" + swivelDeg + "deg) rotateX(" + tiltDeg + "deg) scale(" + scaleVal + ")",
+        transformStyle: "preserve-3d",
+      }}>
         <Img
           src={staticFile("frames/" + frameFilename)}
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
@@ -64,10 +50,10 @@ export const DynamicRoot: React.FC = () => {
     <Composition
       id="Pan3D"
       component={VideoTransition3D}
-      durationInFrames={300}
-      fps={60}
-      width={3840}
-      height={2160}
+      durationInFrames={149}
+      fps={29}
+      width={1920}
+      height={1080}
     />
   );
 };

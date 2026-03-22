@@ -5,3 +5,11 @@ anthropic
 faster-whisper
 python-dotenv
 requests
+opencv-python
+mediapipe
+google-genai
+Pillow
+gspread
+google-auth
+google-auth-oauthlib
+youtube-transcript-api
