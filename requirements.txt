@@ -1,0 +1,7 @@
+torch
+torchaudio
+openai-whisper
+anthropic
+faster-whisper
+python-dotenv
+requests
