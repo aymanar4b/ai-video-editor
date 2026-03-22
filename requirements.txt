@@ -13,3 +13,4 @@ gspread
 google-auth
 google-auth-oauthlib
 youtube-transcript-api
+yt-dlp
