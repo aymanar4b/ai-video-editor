@@ -19,6 +19,9 @@ execution/video_effects/node_modules/
 # OS
 .DS_Store
 
+# Claude Code
+.claude/
+
 # Nick's reference files
 nick files/
 

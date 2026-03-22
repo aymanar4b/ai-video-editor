@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title_suffix %} - Editor{% endblock %}
+
+{% block content %}
+<div class="editor-layout">
+    <div class="editor-left">
+        <h1 class="page-title">Edit a Video</h1>
+        <p class="page-subtitle">Refine your footage with precision AI-driven enhancements.</p>
+
+        <div class="upload-zone" id="uploadZone">
+            <div class="upload-icon">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="1.5">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+            </div>
+            <p class="upload-text">Drag and drop video files</p>
+            <p class="upload-hint">LIMIT 200MB PER FILE &bull; MP4, MOV, WEBM</p>
+            <label class="btn-browse">
+                Browse Files
+                <input type="file" id="videoFile" accept=".mp4,.mov,.mkv,.avi,.webm" hidden>
+            </label>
+        </div>
+
+        <div class="existing-section">
+            <label class="field-label">OR SELECT AN EXISTING PROJECT</label>
+            <div class="select-wrapper">
+                <select id="existingFile" class="custom-select">
+                    <option value="">Select a file...</option>
+                    {% for video in existing_videos %}
+                    <option value="{{ video }}">{{ video }}</option>
+                    {% endfor %}
+                </select>
+                <svg class="select-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            </div>
+        </div>
+    </div>
+
+    <div class="editor-right">
+        <div class="options-card">
+            <div class="card-header">
+                <span class="card-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                </span>
+                <h3>Processing Options</h3>
+            </div>
+
+            <label class="option-item">
+                <div class="option-checkbox">
+                    <input type="checkbox" id="enhanceAudio" checked>
+                    <span class="checkmark"></span>
+                </div>
+                <div class="option-info">
+                    <span class="option-label">Enhance audio</span>
+                    <span class="option-desc">AI-powered noise reduction and leveling</span>
+                </div>
+            </label>
+
+            <label class="option-item">
+                <div class="option-checkbox">
+                    <input type="checkbox" id="detectRestarts">
+                    <span class="checkmark"></span>
+                </div>
+                <div class="option-info">
+                    <span class="option-label">Detect "cut cut" restarts</span>
+                    <span class="option-desc">Automatically remove botched takes</span>
+                </div>
+            </label>
+
+            <div class="option-divider"></div>
+
+            <div class="card-header" style="margin-top: 4px;">
+                <span class="card-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
+                </span>
+                <h3>Swivel Teaser</h3>
+            </div>
+
+            <label class="option-item">
+                <div class="option-checkbox">
+                    <input type="checkbox" id="addTeaser">
+                    <span class="checkmark"></span>
+                </div>
+                <div class="option-info">
+                    <span class="option-label">Add swivel teaser intro</span>
+                    <span class="option-desc">Generate a 5s dynamic preview hook</span>
+                </div>
+            </label>
+
+            <div id="teaserOptions" class="teaser-options hidden">
+                <label class="field-label">PREVIEW CONTENT FROM (SECONDS)</label>
+                <input type="number" id="teaserStart" value="60" min="5" step="5" class="number-input">
+            </div>
+        </div>
+
+        <div class="estimate-card">
+            <span class="estimate-label">ESTIMATED PROCESSING</span>
+            <div class="estimate-value">
+                <span id="estimateTime">--</span>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            </div>
+        </div>
+    </div>
+</div>
+
+<button class="btn-primary-large" id="editBtn" disabled>
+    Edit Video
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+</button>
+
+<!-- Progress overlay -->
+<div class="progress-overlay hidden" id="progressOverlay">
+    <div class="progress-card">
+        <h3>Processing your video...</h3>
+        <div class="progress-bar-container">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <p class="progress-status" id="progressStatus">Initializing...</p>
+        <div class="progress-log" id="progressLog"></div>
+    </div>
+</div>
+
+<!-- Result overlay -->
+<div class="result-overlay hidden" id="resultOverlay">
+    <div class="result-card">
+        <div class="result-header">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            <h3>Video Ready</h3>
+        </div>
+        <div class="result-stats" id="resultStats"></div>
+        <video id="resultVideo" controls class="result-video"></video>
+        <div class="result-actions">
+            <a id="downloadLink" class="btn-primary-large" download>Download Video</a>
+            <button class="btn-secondary" onclick="closeResult()">Edit Another</button>
+        </div>
+    </div>
+</div>
+{% endblock %}

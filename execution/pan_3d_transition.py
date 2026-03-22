@@ -46,6 +46,9 @@ DEFAULT_PLAYBACK_RATE = 7
 DEFAULT_OUTPUT_DURATION = 1.0
 DEFAULT_EASING = "linear"
 DEFAULT_BG_COLOR = "#2d3436"
+DEFAULT_BORDER_COLOR = "#4ecdc4"
+DEFAULT_BORDER_WIDTH = 4
+DEFAULT_BORDER_RADIUS = 12
 
 REMOTION_DIR = Path(__file__).parent / "video_effects"
 
@@ -114,7 +117,10 @@ def render_transition(
     playback_rate: float,
     easing: str = "easeOut",
     bg_color: str = DEFAULT_BG_COLOR,
-    bg_image: str = None
+    bg_image: str = None,
+    border_color: str = DEFAULT_BORDER_COLOR,
+    border_width: int = DEFAULT_BORDER_WIDTH,
+    border_radius: int = DEFAULT_BORDER_RADIUS,
 ) -> None:
     """Render the 3D transition using Remotion."""
     print(f"Rendering 3D transition...")
@@ -213,10 +219,20 @@ const VideoTransition3D: React.FC = () => {{
         transform: "translateY(" + translateY + "%) rotateY(" + swivelDeg + "deg) rotateX(" + tiltDeg + "deg) scale(" + scaleVal + ")",
         transformStyle: "preserve-3d",
       }}}}>
-        <Img
-          src={{staticFile("frames/" + frameFilename)}}
-          style={{{{ width: "100%", height: "100%", objectFit: "cover" }}}}
-        />
+        <div style={{{{
+          width: "100%",
+          height: "100%",
+          border: "{border_width}px solid {border_color}",
+          borderRadius: "{border_radius}px",
+          overflow: "hidden",
+          boxSizing: "border-box",
+          boxShadow: "0 0 30px {border_color}66, 0 0 60px {border_color}33",
+        }}}}>
+          <Img
+            src={{staticFile("frames/" + frameFilename)}}
+            style={{{{ width: "100%", height: "100%", objectFit: "cover" }}}}
+          />
+        </div>
       </AbsoluteFill>
     </AbsoluteFill>
   );
@@ -282,6 +298,9 @@ def create_transition(
     easing: str = DEFAULT_EASING,
     bg_color: str = DEFAULT_BG_COLOR,
     bg_image: str = None,
+    border_color: str = DEFAULT_BORDER_COLOR,
+    border_width: int = DEFAULT_BORDER_WIDTH,
+    border_radius: int = DEFAULT_BORDER_RADIUS,
 ) -> None:
     """Create a 3D pan transition from a video segment."""
 
@@ -324,6 +343,9 @@ def create_transition(
             easing=easing,
             bg_color=bg_color,
             bg_image=bg_image,
+            border_color=border_color,
+            border_width=border_width,
+            border_radius=border_radius,
         )
 
 
@@ -356,6 +378,12 @@ def main():
                         help=f"Background color (hex, default: {DEFAULT_BG_COLOR})")
     parser.add_argument("--bg-image", type=str, default=None,
                         help="Background image path (overrides --bg-color)")
+    parser.add_argument("--border-color", type=str, default=DEFAULT_BORDER_COLOR,
+                        help=f"Border color (hex, default: {DEFAULT_BORDER_COLOR})")
+    parser.add_argument("--border-width", type=int, default=DEFAULT_BORDER_WIDTH,
+                        help=f"Border width in px (default: {DEFAULT_BORDER_WIDTH})")
+    parser.add_argument("--border-radius", type=int, default=DEFAULT_BORDER_RADIUS,
+                        help=f"Border radius in px (default: {DEFAULT_BORDER_RADIUS})")
 
     args = parser.parse_args()
 
@@ -383,6 +411,9 @@ def main():
         easing=args.easing,
         bg_color=args.bg_color,
         bg_image=args.bg_image,
+        border_color=args.border_color,
+        border_width=args.border_width,
+        border_radius=args.border_radius,
     )
 
     print(f"\nDone! Output saved to {args.output}")

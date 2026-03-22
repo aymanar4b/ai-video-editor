@@ -103,89 +103,34 @@ def composite_with_transition(
             bg_image=bg_image,
         )
 
-        # Step 2: Extract segments from original video (video only)
-        print(f"\nExtracting video segments...")
+        # Step 2: Overlay transition onto original video
+        # This preserves the original timeline and audio sync by replacing
+        # only the video frames during the teaser window, rather than
+        # splitting/re-encoding/concatenating which causes drift.
+        print(f"\nOverlaying transition onto original video...")
 
         encoder_args = get_cached_encoder_args()
 
-        # Segment 1: 0 to insert_at
-        seg1_path = os.path.join(tmpdir, "seg1.mp4")
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-t", str(insert_at),
-            "-an",
-        ] + encoder_args + [
-            "-loglevel", "error",
-            seg1_path
-        ]
-        subprocess.run(cmd, check=True)
-        print(f"   Segment 1: 0s - {insert_at}s")
+        # Use FFmpeg overlay filter to replace video during teaser window
+        # - Input 0: original video (keeps audio and timeline intact)
+        # - Input 1: transition video (overlaid during insert_at to insert_at+duration)
+        insert_end = insert_at + duration
 
-        # Segment 2: transition (no audio)
-        seg2_path = os.path.join(tmpdir, "seg2.mp4")
-        cmd = [
-            "ffmpeg", "-y", "-i", transition_path,
-            "-an",
-        ] + encoder_args + [
-            "-loglevel", "error",
-            seg2_path
-        ]
-        subprocess.run(cmd, check=True)
-        print(f"   Segment 2: transition ({duration}s)")
-
-        # Segment 3: insert_at + duration to end
-        seg3_path = os.path.join(tmpdir, "seg3.mp4")
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-ss", str(insert_at + duration),
-            "-an",
-        ] + encoder_args + [
-            "-loglevel", "error",
-            seg3_path
-        ]
-        subprocess.run(cmd, check=True)
-        remaining = total_duration - (insert_at + duration)
-        print(f"   Segment 3: {insert_at + duration}s - end ({remaining:.1f}s)")
-
-        # Step 3: Concatenate video segments
-        print(f"\nConcatenating video segments...")
-        concat_video_path = os.path.join(tmpdir, "concat_video.mp4")
-
-        concat_list = os.path.join(tmpdir, "concat.txt")
-        with open(concat_list, "w") as f:
-            f.write(f"file '{seg1_path}'\n")
-            f.write(f"file '{seg2_path}'\n")
-            f.write(f"file '{seg3_path}'\n")
-
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c", "copy",
-            "-loglevel", "error",
-            concat_video_path
-        ]
-        subprocess.run(cmd, check=True)
-
-        # Step 4: Extract original audio
-        print(f"Extracting original audio...")
-        audio_path = os.path.join(tmpdir, "audio.aac")
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-vn", "-c:a", "aac", "-b:a", "192k",
-            "-loglevel", "error",
-            audio_path
-        ]
-        subprocess.run(cmd, check=True)
-
-        # Step 5: Merge video and audio
-        print(f"Merging video and audio...")
         cmd = [
             "ffmpeg", "-y",
-            "-i", concat_video_path,
-            "-i", audio_path,
-            "-c:v", "copy",
+            "-i", input_path,
+            "-i", transition_path,
+            "-filter_complex",
+            (
+                f"[1:v]setpts=PTS-STARTPTS[trans];"
+                f"[0:v][trans]overlay="
+                f"enable='between(t,{insert_at},{insert_end})':"
+                f"shortest=1[outv]"
+            ),
+            "-map", "[outv]",
+            "-map", "0:a",
             "-c:a", "copy",
-            "-shortest",
+        ] + encoder_args + [
             "-loglevel", "error",
             output_path
         ]
@@ -194,7 +139,7 @@ def composite_with_transition(
     print(f"\nOutput saved to {output_path}")
     print(f"   Timeline: [0-{insert_at}s] [swivel teaser {duration}s] [{insert_at+duration}s-end]")
     print(f"   Teaser shows: {teaser_start}s -> {total_duration:.1f}s ({teaser_content:.1f}s at {playback_rate:.1f}x speed)")
-    print(f"   Audio: Original audio preserved throughout")
+    print(f"   Audio: Original audio preserved (overlay method, no re-sync needed)")
 
 
 def main():

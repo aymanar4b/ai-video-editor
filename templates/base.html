@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auteur AI{% block title_suffix %}{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="/" class="nav-brand">Auteur AI</a>
+        <div class="nav-links">
+            <a href="/" class="nav-link {% if active_page == 'editor' %}active{% endif %}">Editor</a>
+            <a href="/thumbnails" class="nav-link {% if active_page == 'thumbnails' %}active{% endif %}">Thumbnails</a>
+            <a href="/about" class="nav-link {% if active_page == 'about' %}active{% endif %}">About</a>
+        </div>
+        <div class="nav-actions">
+            <button class="nav-icon-btn" title="Settings">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+            </button>
+            <button class="nav-icon-btn" title="Profile">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 1 0-16 0"/></svg>
+            </button>
+            <button class="btn-export">Export</button>
+        </div>
+    </nav>
+
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <span>&copy; 2024 CINEMATIC PRECISION FRAMEWORK. ALL RIGHTS RESERVED.</span>
+        <div class="footer-links">
+            <a href="#">TERMS</a>
+            <a href="#">PRIVACY</a>
+            <a href="#">DOCUMENTATION</a>
+            <a href="#">SUPPORT</a>
+        </div>
+    </footer>
+
+    <script src="/static/js/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

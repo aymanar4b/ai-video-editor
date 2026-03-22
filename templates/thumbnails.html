@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title_suffix %} - Thumbnails{% endblock %}
+
+{% block content %}
+<div class="thumb-layout">
+    <div class="thumb-left">
+        <h1 class="page-title">Thumbnail Generator</h1>
+        <p class="page-subtitle mono">CINEMATIC PRECISION FRAMEWORK V2.4</p>
+
+        <div class="thumb-form-card">
+            <label class="field-label coral">SOURCE MATERIAL</label>
+            <div class="toggle-group">
+                <button class="toggle-btn active" data-mode="youtube" id="btnYoutube">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19.615 3.184c-3.604-.246-11.631-.245-15.23 0-3.897.266-4.356 2.62-4.385 8.816.029 6.185.484 8.549 4.385 8.816 3.6.245 11.626.246 15.23 0 3.897-.266 4.356-2.62 4.385-8.816-.029-6.185-.484-8.549-4.385-8.816zM9 16V8l8 4-8 4z"/></svg>
+                    YouTube URL
+                </button>
+                <button class="toggle-btn" data-mode="upload" id="btnUpload">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    Upload Image
+                </button>
+            </div>
+
+            <div id="youtubeInput">
+                <label class="field-label">YOUTUBE VIDEO URL</label>
+                <div class="input-with-icon">
+                    <input type="text" id="youtubeUrl" class="text-input" placeholder="https://youtube.com/watch?v=...">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="input-icon"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                </div>
+            </div>
+
+            <div id="uploadInput" class="hidden">
+                <label class="field-label">UPLOAD SOURCE THUMBNAIL</label>
+                <div class="thumb-upload-zone" id="thumbUploadZone">
+                    <input type="file" id="thumbFile" accept=".jpg,.jpeg,.png,.webp" hidden>
+                    <p>Drop image or <span class="coral-text">browse</span></p>
+                </div>
+            </div>
+
+            <div class="slider-field">
+                <div class="slider-header">
+                    <label class="field-label">VARIATIONS TO GENERATE</label>
+                    <span class="slider-value" id="variationsValue">03</span>
+                </div>
+                <input type="range" id="variations" min="1" max="5" value="3" class="custom-range">
+            </div>
+
+            <div class="slider-field">
+                <div class="slider-header">
+                    <label class="field-label">REFERENCE PHOTOS TO USE</label>
+                    <span class="slider-value" id="refsValue">02</span>
+                </div>
+                <input type="range" id="refs" min="1" max="5" value="2" class="custom-range">
+            </div>
+
+            <label class="option-item compact">
+                <div class="option-checkbox">
+                    <input type="checkbox" id="skipMatch">
+                    <span class="checkmark"></span>
+                </div>
+                <span class="option-label">Skip face direction matching</span>
+            </label>
+
+            <label class="field-label">ADDITIONAL INSTRUCTIONS</label>
+            <textarea id="thumbPrompt" class="text-area" rows="4" placeholder="Describe the mood, lighting, or specific elements you want to emphasize..."></textarea>
+
+            <button class="btn-generate" id="generateBtn">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                Generate Thumbnails
+            </button>
+        </div>
+    </div>
+
+    <div class="thumb-right">
+        <div class="preview-area" id="previewArea">
+            <div class="preview-dots">
+                <span class="dot teal"></span>
+                <span class="dot teal"></span>
+                <span class="dot teal"></span>
+            </div>
+
+            <div class="preview-placeholder" id="previewPlaceholder">
+                <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="rgba(78,205,196,0.3)" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                <h3>Awaiting Generation</h3>
+                <p>Configured variations will appear here in high-fidelity preview blocks once you start the processing engine.</p>
+            </div>
+
+            <div class="preview-grid hidden" id="previewGrid"></div>
+        </div>
+
+        <div class="feature-cards">
+            <div class="feature-card">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                <h4>Turbo Mode</h4>
+                <p>AI renders at 2.4x speed with priority queuing.</p>
+            </div>
+            <div class="feature-card">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ff8a80" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+                <h4>Style Lock</h4>
+                <p>Maintain brand consistency across all variants.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Progress overlay -->
+<div class="progress-overlay hidden" id="thumbProgressOverlay">
+    <div class="progress-card">
+        <h3>Generating thumbnails...</h3>
+        <div class="progress-bar-container">
+            <div class="progress-bar" id="thumbProgressBar"></div>
+        </div>
+        <p class="progress-status" id="thumbProgressStatus">Initializing...</p>
+    </div>
+</div>
+{% endblock %}

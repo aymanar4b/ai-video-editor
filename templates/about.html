@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title_suffix %} - About{% endblock %}
+
+{% block content %}
+<div class="about-page">
+    <div class="about-badge">DOCUMENTATION & OVERVIEW</div>
+
+    <h1 class="about-hero-title">
+        The Cinematic <span class="coral-text">Precision</span><br>Framework.
+    </h1>
+
+    <p class="about-hero-subtitle">
+        Auteur AI combines high-performance engineering with creative
+        intuition. Designed for professionals who require pixel-perfect control
+        over AI-assisted workflows.
+    </p>
+
+    <div class="about-grid">
+        <div class="about-card large">
+            <div class="card-header">
+                <span class="card-icon-emoji">&#127916;</span>
+                <h3>Video Editing</h3>
+            </div>
+            <ul class="feature-list">
+                <li>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                    Multi-track timeline with sub-frame precision.
+                </li>
+                <li>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                    AI-driven scene detection and auto-cut features.
+                </li>
+                <li>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                    Real-time HDR color grading and LUT support.
+                </li>
+            </ul>
+            <div class="about-preview-img">
+                <div class="preview-mock">
+                    <div class="mock-timeline">
+                        <div class="mock-track t1"></div>
+                        <div class="mock-track t2"></div>
+                        <div class="mock-track t3"></div>
+                    </div>
+                    <span class="mock-label">WORKSPACE PREVIEW V2.4</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="about-card">
+            <div class="card-header">
+                <span class="card-icon-emoji">&#127912;</span>
+                <h3>Thumbnails</h3>
+            </div>
+            <p class="card-desc">Generate high-CTR thumbnails using neural style transfer and automated layout optimization.</p>
+            <div class="stat-bars">
+                <div class="stat-bar">
+                    <span class="stat-label">CLICK PROBABILITY</span>
+                    <span class="stat-value">89.4%</span>
+                    <div class="stat-track"><div class="stat-fill" style="width: 89.4%"></div></div>
+                </div>
+                <div class="stat-bar">
+                    <span class="stat-label">VISUAL BALANCE</span>
+                    <span class="stat-value">OPTIMAL</span>
+                    <div class="stat-track"><div class="stat-fill teal" style="width: 95%"></div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="about-grid">
+        <div class="about-card">
+            <div class="card-header">
+                <span class="card-icon-emoji">&#127908;</span>
+                <h3>Recording Tips</h3>
+            </div>
+            <div class="tip-list">
+                <div class="tip-item">
+                    <div class="tip-bar coral"></div>
+                    <div>
+                        <strong>Acoustic Treatment</strong>
+                        <p>Minimize parallel flat surfaces to reduce standing waves and flutter echo.</p>
+                    </div>
+                </div>
+                <div class="tip-item">
+                    <div class="tip-bar red"></div>
+                    <div>
+                        <strong>Light Temperature</strong>
+                        <p>Maintain a consistent 5600K daylight balance for neutral skin tones.</p>
+                    </div>
+                </div>
+                <div class="tip-item">
+                    <div class="tip-bar orange"></div>
+                    <div>
+                        <strong>Bitrate Settings</strong>
+                        <p>Aim for 12-15 Mbps for 1080p60 to ensure AI upscale compatibility.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="about-card">
+            <div class="card-header">
+                <span class="card-icon-emoji">&#128230;</span>
+                <h3>Requirements</h3>
+            </div>
+            <div class="req-grid">
+                <div class="req-item">
+                    <span class="req-label">ENGINE</span>
+                    <span class="req-value">FFmpeg</span>
+                    <span class="req-version">v6.0+ Required</span>
+                </div>
+                <div class="req-item">
+                    <span class="req-label">RUNTIME</span>
+                    <span class="req-value">Node.js</span>
+                    <span class="req-version">v18 LTS+</span>
+                </div>
+                <div class="req-item">
+                    <span class="req-label">LOGIC</span>
+                    <span class="req-value">Python</span>
+                    <span class="req-version">v3.10+</span>
+                </div>
+            </div>
+            <div class="req-warning">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ff8a80" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                HIGH PERFORMANCE HARDWARE (16GB+ RAM) RECOMMENDED FOR AI SYNTHESIS.
+            </div>
+        </div>
+    </div>
+
+    <div class="arch-section">
+        <h4 class="arch-title">SYSTEM ARCHITECTURE</h4>
+        <div class="arch-flow">
+            <span class="arch-node">UI</span>
+            <span class="arch-line"></span>
+            <span class="arch-node">API</span>
+            <span class="arch-line"></span>
+            <span class="arch-node">FF</span>
+        </div>
+        <div class="arch-meta">
+            <span>AUTH_TOKEN : VERIFIED</span>
+            <span>THREAD_POOL : 12_CORES_ACTIVE</span>
+        </div>
+    </div>
+</div>
+{% endblock %}
