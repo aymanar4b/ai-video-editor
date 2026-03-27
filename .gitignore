@@ -27,3 +27,6 @@ nick files/
 
 # Torch cache
 *.pt
+
+# ML models
+models/

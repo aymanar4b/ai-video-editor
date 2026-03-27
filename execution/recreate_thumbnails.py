@@ -39,48 +39,157 @@ from dotenv import load_dotenv
 from PIL import Image
 from google import genai
 from google.genai import types
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions
 
 load_dotenv()
-
-mp_face_mesh = mp.solutions.face_mesh
 
 # Constants
 REFERENCE_PHOTOS_DIR = Path(__file__).parent.parent / ".tmp" / "reference_photos"
 OUTPUT_DIR = Path(__file__).parent.parent / ".tmp" / "thumbnails"
+MODEL_PATH = Path(__file__).parent.parent / "models" / "face_landmarker.task"
 API_KEY = os.getenv("NANO_BANANA_API_KEY")
 
 MODEL = "gemini-3-pro-image-preview"
 
 THUMB_SIZE = (1280, 720)
-REF_SIZE = (400, 400)
+REF_SIZE = (768, 768)
+SWIPE_DIR = Path(__file__).parent / "swipe_examples"
+
+# ── TikScale Thumbnail Design Playbook (condensed) ──────────────────────────
+PLAYBOOK = """TIKSCALE THUMBNAIL DESIGN PLAYBOOK — MANDATORY RULES:
+
+1. GLANCE TEST: Shrink to mobile size (120px wide). If the core message isn't clear in under 1 second, the design FAILS. Design for the glance, not the stare.
+
+2. THREE ELEMENTS MAX: Every thumbnail has a MAXIMUM of 3 design elements total. Pick from: face with emotion, compelling graphic, large text/numbers/$, aesthetic imagery, or color contrast. NEVER more than 3. Two often works better than three.
+
+3. DESIRE LOOP: Before designing, answer: what does the viewer WANT when they click? (Make money, save time, avoid pain.) The thumbnail must visually activate that desire. Lead with the outcome — a revenue number, a result, a transformation.
+
+4. TITLE-THUMBNAIL SYNERGY: Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title text. If title says "How I Built a $100k Business", thumbnail text should be "From Scratch" or show a revenue screenshot — NOT "$100k Business".
+
+5. FACE EXPRESSION MUST MATCH THE VIDEO TONE:
+   - Shocked/surprised → revelation content, counterintuitive findings
+   - Confident/serious → authority content, strategy breakdowns
+   - Smiling/happy → success stories, results, transformation proof
+   - Concerned/intense → warning content, "stop doing this" videos
+   NOTE: Exaggerated open-mouth shock is DEAD for business channels. Keep it credible.
+
+6. TEXT RULES:
+   - Text is the HIGHEST CONTRAST element on the page
+   - 4 words MAXIMUM. The thumbnail is not a place for sentences.
+   - If it looks too big in the design file, it's probably right at thumbnail size
+   - SPELL EVERY WORD CORRECTLY — double-check each letter
+   - White text on dark backgrounds, or dark text on bright backgrounds
+
+7. COLOR CONTRAST:
+   - Vivid, high-saturation colors that POP against the background
+   - If the niche uses dark backgrounds, consider a light thumbnail to stand out
+   - Orange vs blue = highest contrast combination
+   - Green = good, Red = bad (universal)
+   - NOTHING in the bottom-right corner (YouTube timestamp covers it)
+
+8. SHADOWS FOR SEPARATION: Add drop shadow behind the subject to lift them off the background. Use dark overlay/gradient behind text for readability. This creates professional depth.
+
+9. COMPOSITION TYPES:
+   - Symmetrical: subject centered, both sides balanced — use when subject IS the focus
+   - Asymmetrical (Rule of Thirds): subject at 1/3, text/graphic in remaining 2/3 — most common, most flexible
+   - A/B Split: screen divided showing before/after or problem/solution — use for transformation content
+
+10. THUMBNAIL STYLES THAT PERFORM:
+    - Results-Forward: lead with a big number ($47k, 1M views). Number is dominant, impossible to miss.
+    - Counterintuitive Statement: 4-word text challenging conventional wisdom ("Stop Using Calendly"). Simple background, strong contrast.
+    - Before/After Split: pain state vs solution state side by side.
+    - Authority/Credibility: large number, recognizable logo, or impressive stat front and center.
+    - Diary of a CEO style: white text, red highlight word, dark background — extremely high contrast, text-first.
+
+11. COGNITIVE DISSONANCE: Statements that challenge common beliefs create strong click pull. "You don't need more leads", "Cold email is killing you", "Posting more is wrong". The viewer's brain wants to resolve the contradiction.
+
+QUALITY CHECKLIST:
+☐ Passes glance test at mobile size in under 1 second
+☐ Maximum 3 elements, each identifiable at mobile size
+☐ Text is highest contrast, 4 words max, CORRECTLY SPELLED
+☐ Face expression matches video tone
+☐ Thumbnail does NOT repeat the title — it adds something new
+☐ Colors are vivid and high-saturation, not muted
+☐ Shadow separation between subject and background
+☐ Nothing in bottom-right corner"""
+
+
+def load_swipe_examples() -> list[Image.Image]:
+    """Load all 21 individual cropped swipe file thumbnails."""
+    individual_dir = SWIPE_DIR / "individual"
+    if not individual_dir.exists():
+        return []
+    thumbs = sorted(individual_dir.glob("thumb_*.png"))
+    examples = []
+    for p in thumbs:
+        try:
+            img = Image.open(p)
+            img.thumbnail((768, 768), Image.Resampling.LANCZOS)
+            examples.append(img)
+        except Exception:
+            continue
+    print(f"Loaded {len(examples)} swipe file thumbnails")
+    return examples
+
+
+def normalize_to_thumbnail(img: Image.Image) -> Image.Image:
+    """Resize/crop output to exactly 1280x720 without distorting proportions."""
+    target_w, target_h = THUMB_SIZE
+    target_ratio = target_w / target_h  # 1.778
+
+    w, h = img.size
+    current_ratio = w / h
+
+    if abs(current_ratio - target_ratio) < 0.01:
+        # Already correct ratio, just resize
+        return img.resize(THUMB_SIZE, Image.Resampling.LANCZOS)
+
+    # Crop to 16:9 from center, then resize
+    if current_ratio > target_ratio:
+        # Too wide — crop sides
+        new_w = int(h * target_ratio)
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h))
+    else:
+        # Too tall — crop top/bottom
+        new_h = int(w / target_ratio)
+        top = (h - new_h) // 2
+        img = img.crop((0, top, w, top + new_h))
+
+    return img.resize(THUMB_SIZE, Image.Resampling.LANCZOS)
 
 
 def get_face_pose(image: Image.Image) -> tuple[float, float] | None:
     """Extract yaw and pitch angles from a face in a PIL Image using MediaPipe."""
     img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     h, w = img.shape[:2]
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-    ) as face_mesh:
-        results = face_mesh.process(rgb)
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+        num_faces=1,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=True,
+    )
 
-        if not results.multi_face_landmarks:
+    with FaceLandmarker.create_from_options(options) as landmarker:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                            data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        result = landmarker.detect(mp_image)
+
+        if not result.face_landmarks:
             return None
 
-        landmarks = results.multi_face_landmarks[0].landmark
+        landmarks = result.face_landmarks[0]
 
+        # Use 6 key landmarks for pose estimation via solvePnP
         model_points = np.array([
-            (0.0, 0.0, 0.0),
-            (0.0, -330.0, -65.0),
-            (-225.0, 170.0, -135.0),
-            (225.0, 170.0, -135.0),
-            (-150.0, -150.0, -125.0),
-            (150.0, -150.0, -125.0),
+            (0.0, 0.0, 0.0),        # nose tip
+            (0.0, -330.0, -65.0),    # chin
+            (-225.0, 170.0, -135.0), # left eye outer
+            (225.0, 170.0, -135.0),  # right eye outer
+            (-150.0, -150.0, -125.0),# left mouth corner
+            (150.0, -150.0, -125.0), # right mouth corner
         ], dtype=np.float64)
 
         landmark_indices = [1, 152, 33, 263, 61, 291]
@@ -200,13 +309,20 @@ def download_image(url: str) -> Image.Image:
 
 
 def load_reference_photo(path: Path) -> Image.Image | None:
-    """Load and resize a single reference photo."""
+    """Load and resize a single reference photo, preserving aspect ratio."""
     try:
         img = Image.open(path)
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
-        img = img.resize(REF_SIZE)
-        print(f"Loaded reference: {path.name}")
+        # Center-crop to square first to avoid distorting face proportions
+        w, h = img.size
+        if w != h:
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+        img = img.resize(REF_SIZE, Image.Resampling.LANCZOS)
+        print(f"Loaded reference: {path.name} ({w}x{h} -> {REF_SIZE[0]}x{REF_SIZE[0]})")
         return img
     except Exception as e:
         print(f"Warning: Could not load {path}: {e}")
@@ -247,6 +363,8 @@ def recreate_thumbnail(
     reference_photos: list[Image.Image],
     style_variation: str = "purple/teal gradient",
     additional_prompt: str = "",
+    video_title: str = "",
+    swipe_examples: list[Image.Image] | None = None,
 ) -> Image.Image | None:
     """Recreate a thumbnail with your face swapped in."""
     client = genai.Client(api_key=API_KEY)
@@ -255,18 +373,52 @@ def recreate_thumbnail(
     thumb.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
 
     num_refs = len(reference_photos)
-    prompt = f"""IMAGE 1{' and 2' if num_refs > 1 else ''}: Reference photo(s) of the person's face.
-IMAGE {num_refs + 1}: The thumbnail to edit.
 
-TASK: Replace ONLY the face in the thumbnail with the exact face from the reference(s).
+    # Interleave text labels with images so the model knows which is which
+    contents = []
+    for i, ref in enumerate(reference_photos):
+        contents.append(f"Reference photo {i+1} of the target person — study their exact bone structure, jawline, nose, eyebrows, skin tone, and hair:")
+        contents.append(ref)
 
-The output must be a 100% exact duplicate of the thumbnail, except the face is swapped with the reference face. Keep every single pixel identical outside the face region.
+    contents.append("Source YouTube thumbnail — recreate this with the target person's face:")
+    contents.append(thumb)
 
-Output in 16:9 format.
+    # Add swipe file examples as style references
+    if swipe_examples is None:
+        swipe_examples = load_swipe_examples()
+    if swipe_examples:
+        contents.append("STYLE REFERENCE — These are real high-performing YouTube thumbnails (100k-3M+ views). Study their style, composition, contrast, and text treatment. Your output should match this level of quality:")
+        for ex in swipe_examples:
+            contents.append(ex)
+
+    title_section = ""
+    if video_title:
+        title_section = f"""
+VIDEO TITLE: "{video_title}"
+TITLE-THUMBNAIL SYNERGY: Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title. If title says "How I Built a $100k Business", thumbnail text should be "From Scratch" or show a revenue screenshot — NOT "$100k Business"."""
+
+    prompt = f"""You are an expert YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Recreate the source thumbnail above, replacing the person with the face from the reference photos.
+
+FACE SWAP RULES:
+- ⚠️ #1 PRIORITY — IDENTITY: ONLY the person from the reference photos may appear. Do NOT invent, hallucinate, or substitute ANY other face. Every face in the output MUST be the reference person. If the source has multiple people, replace ALL of them with the reference person or remove extras. Copy exact bone structure, jawline, nose shape, eyebrow shape, skin tone, hair color, hair texture. Before generating, look at the reference photos ONE MORE TIME.
+- ONE PERSON RULE: If the thumbnail has only one person visible, that person MUST be the reference person. No exceptions.
+- PROPORTION RULE: Face must have NATURAL human proportions. Do NOT squeeze, stretch, or distort horizontally or vertically.
+- Keep same head size, position, and angle as the original.
+- SKIN TONE CONSISTENCY: Face skin tone must match ALL visible skin (neck, hands, arms). Match scene lighting.
+- TEXT ACCURACY: If there is text in the thumbnail, spell EVERY word CORRECTLY. Double-check each letter. No repeated letters, no missing letters. "ASLEEP" not "ASLEEEP".
+
+REPLICATE RULES:
+- Keep ALL text overlays EXACTLY as source: same words, font, size, position, color.
+- Keep ALL graphic elements, logos, objects, background, clothing, and body pose identical.
+
+{PLAYBOOK}
+{title_section}
+
+OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail, not AI-generated.
 
 {additional_prompt}"""
 
-    contents = reference_photos + [thumb, prompt]
+    contents.append(prompt)
 
     print(f"\nGenerating with {len(reference_photos)} reference photos...")
 
@@ -285,7 +437,7 @@ Output in 16:9 format.
                     data = part.inline_data.data
                     if data:
                         img_bytes = base64.b64decode(data) if isinstance(data, str) else data
-                        return Image.open(io.BytesIO(img_bytes))
+                        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
                 elif hasattr(part, 'text') and part.text:
                     print(f"Model note: {part.text[:200]}")
 
@@ -297,12 +449,238 @@ Output in 16:9 format.
         return None
 
 
+def mashup_thumbnail(
+    source_a: Image.Image,
+    source_b: Image.Image,
+    reference_photos: list[Image.Image],
+    additional_prompt: str = "",
+    video_title: str = "",
+    swipe_examples: list[Image.Image] | None = None,
+) -> Image.Image | None:
+    """Merge two thumbnails together with the client's face."""
+    api_client = genai.Client(api_key=API_KEY)
+
+    thumb_a = source_a.copy()
+    thumb_a.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
+    thumb_b = source_b.copy()
+    thumb_b.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
+
+    contents = []
+    for i, ref in enumerate(reference_photos):
+        contents.append(f"Reference photo {i+1} of the target person — study their exact face:")
+        contents.append(ref)
+
+    contents.append("Thumbnail A — take design elements, composition ideas, or style from this:")
+    contents.append(thumb_a)
+    contents.append("Thumbnail B — take design elements, composition ideas, or style from this:")
+    contents.append(thumb_b)
+
+    # Add swipe file examples as style references
+    if swipe_examples is None:
+        swipe_examples = load_swipe_examples()
+    if swipe_examples:
+        contents.append("STYLE REFERENCE — Real high-performing YouTube thumbnails (100k-3M+ views). Match this quality level:")
+        for ex in swipe_examples:
+            contents.append(ex)
+
+    title_section = ""
+    if video_title:
+        title_section = f"""
+VIDEO TITLE: "{video_title}"
+TITLE-THUMBNAIL SYNERGY: Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title. Use shorter, punchier text (max 4 words) that pairs with the title."""
+
+    prompt = f"""You are an expert YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a NEW thumbnail that merges the best elements from Thumbnail A and Thumbnail B above. Use the target person's face from the reference photos.
+
+MASHUP RULES:
+- Combine the strongest design elements from both thumbnails: composition, color scheme, text style, graphic elements, background.
+- ⚠️ #1 PRIORITY — IDENTITY: ONLY the person from the reference photos may appear. Do NOT invent, hallucinate, or substitute ANY other face. Every face in the output MUST be the reference person. Copy exact bone structure, jawline, nose, eyebrows, skin tone, hair. Before generating, look at the reference photos ONE MORE TIME.
+- ONE PERSON RULE: If the thumbnail has only one person visible, that person MUST be the reference person. No exceptions.
+- PROPORTION RULE: Face must have NATURAL human proportions. No squeezing or stretching.
+- Pick the best composition from either thumbnail or blend them. Result must feel cohesive, not a collage.
+- SKIN TONE CONSISTENCY: Face skin tone must match ALL visible skin. Match scene lighting.
+- TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter. No repeated or missing letters.
+
+{PLAYBOOK}
+{title_section}
+
+OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail.
+
+{additional_prompt}"""
+
+    contents.append(prompt)
+
+    print(f"\nMashup generating with {len(reference_photos)} reference photos...")
+
+    try:
+        response = api_client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
+
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    data = part.inline_data.data
+                    if data:
+                        img_bytes = base64.b64decode(data) if isinstance(data, str) else data
+                        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
+                elif hasattr(part, 'text') and part.text:
+                    print(f"Model note: {part.text[:200]}")
+
+        print("No image in response")
+        return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
+def imagine_thumbnail(
+    reference_photos: list[Image.Image],
+    additional_prompt: str = "",
+    video_title: str = "",
+    swipe_examples: list[Image.Image] | None = None,
+) -> Image.Image | None:
+    """Generate a thumbnail from imagination using the playbook principles."""
+    api_client = genai.Client(api_key=API_KEY)
+
+    contents = []
+    for i, ref in enumerate(reference_photos):
+        contents.append(f"Reference photo {i+1} of the person who must appear in the thumbnail:")
+        contents.append(ref)
+
+    # Add swipe file examples as style references
+    if swipe_examples is None:
+        swipe_examples = load_swipe_examples()
+    if swipe_examples:
+        contents.append("STYLE REFERENCE — Real high-performing YouTube thumbnails (100k-3M+ views). Your output MUST match this level of quality, composition, and visual impact:")
+        for ex in swipe_examples:
+            contents.append(ex)
+
+    title_section = ""
+    if video_title:
+        title_section = f"""
+VIDEO TITLE: "{video_title}"
+TITLE-THUMBNAIL SYNERGY: This is CRITICAL. Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title. Use shorter, punchier overlay text (max 4 words) that pairs with the title. Example: if title is "I Made $50k in 30 Days", thumbnail text = "$50K" with shocked face — title provides context."""
+
+    if additional_prompt:
+        prompt = f"""You are an elite YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a stunning, high-CTR YouTube thumbnail featuring the person from the reference photos.
+
+CREATIVE DIRECTION: {additional_prompt}
+"""
+    else:
+        prompt = """You are an elite YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a stunning, high-CTR YouTube thumbnail featuring the person from the reference photos.
+
+Use your creativity to design something that would make a viewer STOP scrolling and CLICK.
+"""
+
+    prompt += f"""
+CRITICAL RULES:
+- ⚠️ #1 PRIORITY — IDENTITY: ONLY the person from the reference photos may appear. Do NOT invent, hallucinate, or substitute ANY other face. Every face in the output MUST be the reference person. Copy exact bone structure, jawline, nose, eyebrows, skin tone, hair. Before generating, look at the reference photos ONE MORE TIME.
+- ONE PERSON RULE: If the thumbnail has only one person visible, that person MUST be the reference person. No exceptions.
+- PROPORTION: Face must have NATURAL human proportions. No squeezing or stretching.
+- SKIN TONE: Must match across face and all visible body parts. Match scene lighting.
+- TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter. No repeated letters ("ASLEEP" not "ASLEEEP"), no missing letters.
+
+{PLAYBOOK}
+{title_section}
+
+OUTPUT: 1280x720 pixels, 16:9. Must look like a top-tier professional YouTube thumbnail that would get 100k+ views."""
+
+    contents.append(prompt)
+
+    print(f"\nImagine mode: generating with {len(reference_photos)} reference photos...")
+
+    try:
+        response = api_client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
+
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    data = part.inline_data.data
+                    if data:
+                        img_bytes = base64.b64decode(data) if isinstance(data, str) else data
+                        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
+                elif hasattr(part, 'text') and part.text:
+                    print(f"Model note: {part.text[:200]}")
+
+        print("No image in response")
+        return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
+def verify_and_fix(
+    generated: Image.Image,
+    reference_photos: list[Image.Image],
+) -> Image.Image:
+    """Verify the generated thumbnail has correct identity and spelling. Fix if needed."""
+    api_client = genai.Client(api_key=API_KEY)
+
+    contents = []
+    for i, ref in enumerate(reference_photos):
+        contents.append(f"Reference photo {i+1} of the CORRECT person:")
+        contents.append(ref)
+
+    contents.append("Generated thumbnail to verify:")
+    contents.append(generated)
+
+    contents.append("""VERIFICATION TASK — Check this thumbnail for TWO issues:
+
+1. FACE IDENTITY: Does every face in this thumbnail match the reference person above? Check bone structure, jawline, nose, eyebrows, skin tone, hair. If ANY face belongs to a different person, regenerate the ENTIRE thumbnail with the correct person's face.
+
+2. TEXT SPELLING: Read every word of text in the thumbnail. Is every word spelled correctly? Check letter by letter. If any word has repeated letters (e.g. "ASLEEEP"), missing letters, or misspellings, fix the text.
+
+If BOTH checks pass, return the thumbnail EXACTLY as-is with no changes.
+If EITHER check fails, output a corrected version of the thumbnail with the issues fixed. Keep everything else identical — same composition, colors, layout, style.
+
+Output the image in 16:9 format (1280x720).""")
+
+    try:
+        response = api_client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
+
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    print(f"  Verify: {part.text[:200]}")
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    data = part.inline_data.data
+                    if data:
+                        img_bytes = base64.b64decode(data) if isinstance(data, str) else data
+                        print("  Verify: returned corrected image")
+                        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
+
+        print("  Verify: no image returned, keeping original")
+        return generated
+
+    except Exception as e:
+        print(f"  Verify error: {e}, keeping original")
+        return generated
+
+
 def edit_thumbnail(
     source_image: Image.Image,
     edit_instructions: str,
 ) -> Image.Image | None:
     """Edit an existing thumbnail with high-level instructions."""
-    client = genai.Client(api_key=API_KEY)
+    api_client = genai.Client(api_key=API_KEY)
 
     thumb = source_image.copy()
     thumb.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
@@ -319,7 +697,7 @@ Output in 16:9 format."""
     print(f"\nEditing with instructions: {edit_instructions[:100]}...")
 
     try:
-        response = client.models.generate_content(
+        response = api_client.models.generate_content(
             model=MODEL,
             contents=[thumb, prompt],
             config=types.GenerateContentConfig(
@@ -333,7 +711,7 @@ Output in 16:9 format."""
                     data = part.inline_data.data
                     if data:
                         img_bytes = base64.b64decode(data) if isinstance(data, str) else data
-                        return Image.open(io.BytesIO(img_bytes))
+                        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
                 elif hasattr(part, 'text') and part.text:
                     print(f"Model note: {part.text[:200]}")
 
@@ -355,6 +733,13 @@ def main():
                         help="Source thumbnail URL or file path")
     parser.add_argument("--edit", "-e", type=str,
                         help="Edit an existing thumbnail (path to image)")
+    parser.add_argument("--mode", type=str, default="replicate",
+                        choices=["replicate", "mashup", "imagine"],
+                        help="Generation mode: replicate, mashup, or imagine")
+    parser.add_argument("--source2", type=str,
+                        help="Second source thumbnail for mashup mode (URL or file path)")
+    parser.add_argument("--youtube2", type=str,
+                        help="Second YouTube URL for mashup mode")
     parser.add_argument("--style", type=str,
                         default="purple/teal gradient with modern aesthetic",
                         help="Style variation to apply")
@@ -368,8 +753,16 @@ def main():
                         help="Number of variations to generate (default: 3)")
     parser.add_argument("--no-match", action="store_true",
                         help="Skip face direction matching")
+    parser.add_argument("--title", "-t", type=str, default="",
+                        help="Video title — thumbnail will be designed to complement it")
+    parser.add_argument("--ref-dir", type=str, default=None,
+                        help="Override reference photos directory")
 
     args = parser.parse_args()
+
+    if args.ref_dir:
+        global REFERENCE_PHOTOS_DIR
+        REFERENCE_PHOTOS_DIR = Path(args.ref_dir)
 
     if not API_KEY:
         print("Error: NANO_BANANA_API_KEY not set in .env")
@@ -380,6 +773,7 @@ def main():
     date_folder = OUTPUT_DIR / datetime.now().strftime("%Y%m%d")
     date_folder.mkdir(parents=True, exist_ok=True)
     time_stamp = datetime.now().strftime("%H%M%S")
+    print(f"TIMESTAMP:{time_stamp}")
 
     # === EDIT MODE ===
     if args.edit:
@@ -407,31 +801,80 @@ def main():
         print(f"Size: {result.size}")
         return [str(output_path)]
 
-    # === RECREATION MODE ===
-    if not args.youtube and not args.source:
-        print("Error: Provide --youtube URL, --source image, or --edit image")
+    # === LOAD SOURCE IMAGE(S) ===
+    def load_source(youtube_arg, source_arg):
+        """Load a source image from YouTube URL or file/URL path."""
+        if youtube_arg:
+            video_id = extract_video_id(youtube_arg)
+            if not video_id:
+                print(f"Error: Could not extract video ID from {youtube_arg}")
+                sys.exit(1)
+            print(f"Video ID: {video_id}")
+            img = get_youtube_thumbnail(video_id)
+            if not img:
+                print("Error: Could not download YouTube thumbnail")
+                sys.exit(1)
+            return img
+        elif source_arg:
+            print(f"Loading source: {source_arg}")
+            if source_arg.startswith(("http://", "https://")):
+                return download_image(source_arg)
+            else:
+                return Image.open(source_arg)
+        return None
+
+    # Load swipe examples once for all variations
+    swipe_examples = load_swipe_examples()
+
+    # === IMAGINE MODE (no source needed) ===
+    if args.mode == "imagine":
+        print(f"Mode: IMAGINE — generating from creativity")
+        reference_photos = load_reference_photos(max_photos=args.refs)
+        if not reference_photos:
+            print("Warning: No reference photos found. Results may vary.")
+
+        output_paths = []
+        for i in range(args.variations):
+            print(f"\n--- Variation {i + 1}/{args.variations} ---")
+            result = imagine_thumbnail(
+                reference_photos=reference_photos,
+                additional_prompt=args.prompt,
+                video_title=args.title,
+                swipe_examples=swipe_examples,
+            )
+            if result is None:
+                print(f"Failed to generate variation {i + 1}")
+                continue
+            # Verify identity and spelling
+            if reference_photos:
+                print(f"  Running verify & fix pass...")
+                result = verify_and_fix(result, reference_photos)
+            output_path = date_folder / f"{time_stamp}_{i + 1}.png"
+            result.save(output_path)
+            output_paths.append(str(output_path))
+            print(f"Saved: {output_path}")
+            print(f"Size: {result.size}")
+
+        print(f"\n=== Generated {len(output_paths)}/{args.variations} variations ===")
+        for path in output_paths:
+            print(f"  - {path}")
+        return output_paths
+
+    # === REPLICATE & MASHUP MODES (need source) ===
+    source_image = load_source(args.youtube, args.source)
+    if not source_image:
+        print("Error: Provide --youtube URL or --source image")
         sys.exit(1)
-
-    source_image = None
-
-    if args.youtube:
-        video_id = extract_video_id(args.youtube)
-        if not video_id:
-            print(f"Error: Could not extract video ID from {args.youtube}")
-            sys.exit(1)
-        print(f"Video ID: {video_id}")
-        source_image = get_youtube_thumbnail(video_id)
-        if not source_image:
-            print("Error: Could not download YouTube thumbnail")
-            sys.exit(1)
-    elif args.source:
-        print(f"Loading source: {args.source}")
-        if args.source.startswith(("http://", "https://")):
-            source_image = download_image(args.source)
-        else:
-            source_image = Image.open(args.source)
-
     print(f"Source size: {source_image.size}")
+
+    # Load second source for mashup
+    source_image_b = None
+    if args.mode == "mashup":
+        source_image_b = load_source(args.youtube2, args.source2)
+        if not source_image_b:
+            print("Error: Mashup mode requires a second source (--youtube2 or --source2)")
+            sys.exit(1)
+        print(f"Source B size: {source_image_b.size}")
 
     # Analyze face direction
     best_reference = None
@@ -461,16 +904,33 @@ def main():
     for i in range(args.variations):
         print(f"\n--- Variation {i + 1}/{args.variations} ---")
 
-        result = recreate_thumbnail(
-            source_image=source_image,
-            reference_photos=reference_photos,
-            style_variation=args.style,
-            additional_prompt=args.prompt,
-        )
+        if args.mode == "mashup":
+            result = mashup_thumbnail(
+                source_a=source_image,
+                source_b=source_image_b,
+                reference_photos=reference_photos,
+                additional_prompt=args.prompt,
+                video_title=args.title,
+                swipe_examples=swipe_examples,
+            )
+        else:
+            result = recreate_thumbnail(
+                source_image=source_image,
+                reference_photos=reference_photos,
+                style_variation=args.style,
+                additional_prompt=args.prompt,
+                video_title=args.title,
+                swipe_examples=swipe_examples,
+            )
 
         if result is None:
             print(f"Failed to generate variation {i + 1}")
             continue
+
+        # Verify identity and spelling
+        if reference_photos:
+            print(f"  Running verify & fix pass...")
+            result = verify_and_fix(result, reference_photos)
 
         if args.output and args.variations == 1:
             output_path = date_folder / args.output
