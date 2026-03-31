@@ -12,6 +12,7 @@ import os
 import subprocess
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, send_file
@@ -191,6 +192,7 @@ def api_thumbnails():
     video_title = request.form.get('video_title', '')
     client_slug = request.form.get('client', '')
     mode = request.form.get('mode', 'replicate')
+    swipe_files = request.form.get('swipe_files', '')
 
     # Handle image uploads
     source_path = None
@@ -253,10 +255,18 @@ def api_thumbnails():
                 client_refs = CLIENTS_DIR / client_slug / "reference_photos"
                 if client_refs.exists():
                     cmd += ["--ref-dir", str(client_refs)]
+            if swipe_files:
+                cmd += ["--swipe-files", swipe_files]
 
             num_vars = int(variations)
             log_lines = []
             run_timestamp = None  # Will be parsed from script output
+
+            # Debug log to file (avoids stdout buffering)
+            debug_log = BASE_DIR / "thumb_debug.log"
+            with open(debug_log, "a") as dl:
+                dl.write(f"\n=== [{task_id}] {datetime.now()} ===\n")
+                dl.write(f"CMD: {' '.join(cmd)}\n")
 
             # Stream output for real progress
             proc = subprocess.Popen(
@@ -281,6 +291,9 @@ def api_thumbnails():
                 elif 'Downloaded thumbnail' in line or 'Loading source' in line:
                     tasks[task_id]['status'] = 'Analyzing face direction...'
                     tasks[task_id]['progress'] = 20
+                elif 'Enhancing prompt' in line:
+                    tasks[task_id]['status'] = 'Enhancing prompt with AI...'
+                    tasks[task_id]['progress'] = 25
                 elif 'Detected pose' in line:
                     tasks[task_id]['status'] = 'Loading reference photos...'
                     tasks[task_id]['progress'] = 30
@@ -297,16 +310,39 @@ def api_thumbnails():
                     tasks[task_id]['progress'] = min(tasks[task_id]['progress'] + 10, 90)
                 elif 'Error: 429' in line or 'RESOURCE_EXHAUSTED' in line:
                     tasks[task_id]['status'] = 'API rate limited, retrying...'
+                elif 'RETRY: Content filter blocked' in line:
+                    tasks[task_id]['status'] = 'Content filter blocked, retrying with heavier anonymization...'
+                elif 'All anonymization levels exhausted' in line:
+                    tasks[task_id]['status'] = 'Content filter blocked all attempts for this variation'
                 elif 'Failed to generate' in line:
                     pass  # already tracked
 
             proc.wait()
             kill_timer.cancel()
+            with open(debug_log, "a") as dl:
+                dl.write(f"EXIT CODE: {proc.returncode}\n")
+                dl.write(f"TIMESTAMP parsed: {run_timestamp}\n")
+                # Capture enhanced prompt if present
+                for ll in log_lines:
+                    if 'Enhanced prompt:' in ll or (log_lines and any('Enhanced prompt:' in x for x in log_lines)):
+                        break
+                # Write all lines for full context
+                dl.write(f"FULL LOG ({len(log_lines)} lines):\n")
+                for ll in log_lines:
+                    dl.write(f"  {ll}\n")
+                dl.write(f"LAST 20 LINES:\n")
+                for ll in log_lines[-20:]:
+                    dl.write(f"  {ll}\n")
 
             # Find generated thumbnails — only from THIS run's timestamp
-            from datetime import datetime
             today_dir = TMP_DIR / "thumbnails" / datetime.now().strftime("%Y%m%d")
             found_thumbs = []
+            with open(debug_log, "a") as dl:
+                dl.write(f"TODAY DIR: {today_dir} exists={today_dir.exists()}\n")
+                if today_dir.exists():
+                    all_pngs = list(today_dir.glob("*.png"))
+                    dl.write(f"ALL PNGs in dir: {[p.name for p in all_pngs]}\n")
+                    dl.write(f"Looking for pattern: {run_timestamp}_*.png\n")
             if today_dir.exists():
                 if run_timestamp:
                     # Match only files from this run (e.g. 143052_1.png, 143052_2.png)
@@ -324,6 +360,53 @@ def api_thumbnails():
                 tasks[task_id]['state'] = 'done'
                 tasks[task_id]['progress'] = 100
                 tasks[task_id]['status'] = f'Generated {len(found_thumbs)} thumbnail(s)!'
+
+                # Save generation metadata alongside thumbnails
+                try:
+                    import json as _json
+                    meta = {
+                        'mode': mode,
+                        'youtube_url': youtube_url,
+                        'youtube_url2': youtube_url2,
+                        'prompt': prompt,
+                        'video_title': video_title,
+                        'client': client_slug,
+                        'variations': variations,
+                        'refs': refs,
+                        'swipe_files': swipe_files,
+                    }
+                    # Save source thumbnail for reference
+                    if youtube_url and run_timestamp:
+                        try:
+                            import re as _re
+                            vid_match = _re.search(r'[?&]v=([A-Za-z0-9_-]{11})', youtube_url)
+                            if vid_match:
+                                vid_id = vid_match.group(1)
+                                import urllib.request
+                                source_img_path = today_dir / f"{run_timestamp}_source.jpg"
+                                for qual in ['maxresdefault', 'hqdefault']:
+                                    try:
+                                        urllib.request.urlretrieve(
+                                            f"https://img.youtube.com/vi/{vid_id}/{qual}.jpg",
+                                            str(source_img_path)
+                                        )
+                                        meta['source_thumb'] = f"thumbnails/{today_dir.name}/{source_img_path.name}"
+                                        break
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
+                    elif source_path:
+                        import shutil
+                        src_copy = today_dir / f"{run_timestamp}_source{Path(str(source_path)).suffix}"
+                        shutil.copy2(str(source_path), str(src_copy))
+                        meta['source_thumb'] = f"thumbnails/{today_dir.name}/{src_copy.name}"
+
+                    meta_path = today_dir / f"{run_timestamp}_meta.json"
+                    with open(meta_path, 'w') as mf:
+                        _json.dump(meta, mf)
+                except Exception:
+                    pass  # Metadata is non-critical
             else:
                 # Extract a meaningful error from the log
                 full_log = '\n'.join(log_lines)
@@ -336,6 +419,7 @@ def api_thumbnails():
                 tasks[task_id]['state'] = 'error'
                 tasks[task_id]['progress'] = 100
                 tasks[task_id]['error'] = error_msg
+                tasks[task_id]['log'] = '\n'.join(log_lines[-50:])
 
         except subprocess.TimeoutExpired:
             tasks[task_id]['state'] = 'error'
@@ -428,7 +512,98 @@ def api_progress(task_id):
     return jsonify(task)
 
 
+# ─── API: Thumbnail History ──────────────────────────────────────────────────
+
+@app.route('/api/thumbnails/history')
+def api_thumbnail_history():
+    """Return all saved thumbnails grouped by generation timestamp, newest first."""
+    thumb_dir = BASE_DIR / ".tmp" / "thumbnails"
+    if not thumb_dir.exists():
+        return jsonify([])
+
+    groups = []
+    # Scan date folders in reverse order (newest date first)
+    date_dirs = sorted(thumb_dir.iterdir(), reverse=True)
+    for date_dir in date_dirs:
+        if not date_dir.is_dir():
+            continue
+        date_str = date_dir.name  # e.g. "20260329"
+
+        # Group PNGs by timestamp prefix (HHMMSS)
+        from collections import defaultdict
+        ts_groups = defaultdict(list)
+        ts_meta = {}
+        for f in sorted(date_dir.glob("*.png")):
+            # Skip source images (e.g. 104936_source.jpg saved as png)
+            if '_source' in f.stem:
+                continue
+            parts = f.stem.split("_")  # e.g. "104936_1" -> ["104936", "1"]
+            if len(parts) >= 2:
+                ts_groups[parts[0]].append(f"thumbnails/{date_str}/{f.name}")
+
+        # Load metadata files
+        import json as _json
+        for f in date_dir.glob("*_meta.json"):
+            ts_key = f.stem.replace("_meta", "")
+            try:
+                with open(f) as mf:
+                    ts_meta[ts_key] = _json.load(mf)
+            except Exception:
+                pass
+
+        # Convert to list, newest timestamp first
+        for ts in sorted(ts_groups.keys(), reverse=True):
+            # Parse timestamp for display
+            try:
+                h, m = int(ts[:2]), int(ts[2:4])
+                ampm = "AM" if h < 12 else "PM"
+                h12 = h % 12 or 12
+                time_label = f"{h12}:{m:02d} {ampm}"
+            except (ValueError, IndexError):
+                time_label = ts
+
+            # Format date
+            try:
+                from datetime import datetime as dt
+                d = dt.strptime(date_str, "%Y%m%d")
+                date_label = d.strftime("%b %d")
+            except ValueError:
+                date_label = date_str
+
+            entry = {
+                'label': f"{date_label}, {time_label}",
+                'paths': ts_groups[ts],
+            }
+            if ts in ts_meta:
+                entry['meta'] = ts_meta[ts]
+            groups.append(entry)
+
+    return jsonify(groups)
+
+
 # ─── API: File Download ──────────────────────────────────────────────────────
+
+@app.route('/api/swipe-examples')
+def api_swipe_examples():
+    """List all available swipe file thumbnails."""
+    swipe_dir = EXECUTION_DIR / "swipe_examples" / "individual"
+    if not swipe_dir.exists():
+        return jsonify([])
+    thumbs = sorted(swipe_dir.glob("thumb_*.png"))
+    return jsonify([
+        {'name': t.name, 'url': f'/api/swipe-img/{t.name}'}
+        for t in thumbs
+    ])
+
+
+@app.route('/api/swipe-img/<filename>')
+def api_swipe_img(filename):
+    """Serve a swipe example image."""
+    file_path = EXECUTION_DIR / "swipe_examples" / "individual" / filename
+    if file_path.exists():
+        return send_file(str(file_path))
+    return 'Not found', 404
+
 
 @app.route('/api/download/<path:filename>')
 def api_download(filename):

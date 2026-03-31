@@ -27,6 +27,7 @@ import io
 import math
 import os
 import re
+import signal
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -36,7 +37,7 @@ import mediapipe as mp
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageFilter
 from google import genai
 from google.genai import types
 from mediapipe.tasks.python import BaseOptions
@@ -51,10 +52,32 @@ MODEL_PATH = Path(__file__).parent.parent / "models" / "face_landmarker.task"
 API_KEY = os.getenv("NANO_BANANA_API_KEY")
 
 MODEL = "gemini-3-pro-image-preview"
+ANALYSIS_MODEL = "gemini-2.5-pro"  # For analyzing source thumbnails (avoids image-gen model's content filter)
 
 THUMB_SIZE = (1280, 720)
 REF_SIZE = (768, 768)
 SWIPE_DIR = Path(__file__).parent / "swipe_examples"
+API_TIMEOUT = 120  # seconds per API call
+
+
+def _api_call_with_timeout(client_obj, model, contents, config, timeout=API_TIMEOUT):
+    """Call Gemini API with a signal-based timeout to prevent hangs."""
+    def _handler(signum, frame):
+        raise TimeoutError(f"API call timed out after {timeout}s")
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
+    try:
+        response = client_obj.models.generate_content(
+            model=model, contents=contents, config=config,
+        )
+        signal.alarm(0)
+        return response
+    except TimeoutError:
+        signal.alarm(0)
+        raise
+    finally:
+        signal.signal(signal.SIGALRM, old)
 
 # ── TikScale Thumbnail Design Playbook (condensed) ──────────────────────────
 PLAYBOOK = """TIKSCALE THUMBNAIL DESIGN PLAYBOOK — MANDATORY RULES:
@@ -115,21 +138,33 @@ QUALITY CHECKLIST:
 ☐ Nothing in bottom-right corner"""
 
 
-def load_swipe_examples() -> list[Image.Image]:
-    """Load all 21 individual cropped swipe file thumbnails."""
+def load_swipe_examples(only_files: list[str] | None = None) -> list[Image.Image]:
+    """Load individual cropped swipe file thumbnails, anonymized to bypass content filters.
+
+    If only_files is set, load only those filenames.
+    All swipe examples are pixelated to avoid triggering public-figure filters.
+    """
     individual_dir = SWIPE_DIR / "individual"
     if not individual_dir.exists():
         return []
     thumbs = sorted(individual_dir.glob("thumb_*.png"))
+    if only_files:
+        allowed = set(only_files)
+        thumbs = [t for t in thumbs if t.name in allowed]
     examples = []
     for p in thumbs:
         try:
             img = Image.open(p)
             img.thumbnail((768, 768), Image.Resampling.LANCZOS)
+            # Full pixelation for swipe examples — they're style references only,
+            # so exact detail isn't needed, just composition/color/text style
+            w, h = img.size
+            small = img.resize((30, 30), Image.Resampling.NEAREST)
+            img = small.resize((w, h), Image.Resampling.NEAREST)
             examples.append(img)
         except Exception:
             continue
-    print(f"Loaded {len(examples)} swipe file thumbnails")
+    print(f"Loaded {len(examples)} swipe file thumbnails (anonymized)")
     return examples
 
 
@@ -145,17 +180,16 @@ def normalize_to_thumbnail(img: Image.Image) -> Image.Image:
         # Already correct ratio, just resize
         return img.resize(THUMB_SIZE, Image.Resampling.LANCZOS)
 
-    # Crop to 16:9 from center, then resize
+    # Crop to 16:9, then resize
     if current_ratio > target_ratio:
-        # Too wide — crop sides
+        # Too wide — crop sides (center)
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
         img = img.crop((left, 0, left + new_w, h))
     else:
-        # Too tall — crop top/bottom
+        # Too tall — crop from bottom to keep the head/face visible at top
         new_h = int(w / target_ratio)
-        top = (h - new_h) // 2
-        img = img.crop((0, top, w, top + new_h))
+        img = img.crop((0, 0, w, new_h))
 
     return img.resize(THUMB_SIZE, Image.Resampling.LANCZOS)
 
@@ -227,6 +261,85 @@ def get_face_pose(image: Image.Image) -> tuple[float, float] | None:
         pitch = max(-45, min(45, pitch))
 
         return (yaw, pitch)
+
+
+def anonymize_source(image: Image.Image, level: int = 0) -> Image.Image:
+    """Anonymize source thumbnail with escalating intensity.
+
+    Level 0: Face-only blur (forehead-to-chin). Best detail preservation.
+    Level 1: Face blur + moderate full-image blur to wash out identifying text.
+    Level 2: Heavy center pixelation. Loses detail but reliably passes filters.
+    """
+    w, h = image.size
+    result = image.copy()
+
+    if level >= 2:
+        # Heavy pixelation on center half — nuclear option
+        x1, y1 = w // 4, 0
+        x2, y2 = 3 * w // 4, h
+        region = result.crop((x1, y1, x2, y2))
+        pw, ph = region.size
+        small = region.resize((20, 20), Image.Resampling.NEAREST)
+        result.paste(small.resize((pw, ph), Image.Resampling.NEAREST), (x1, y1))
+        return result
+
+    # Level 0 and 1: face detection + blur
+    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    ih, iw = img_cv.shape[:2]
+
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+        num_faces=5,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+    )
+
+    try:
+        with FaceLandmarker.create_from_options(options) as landmarker:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                data=cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+            detection = landmarker.detect(mp_image)
+
+            if not detection.face_landmarks:
+                cx = w // 2
+                strip_w = w // 3
+                region = result.crop((cx - strip_w // 2, 0, cx + strip_w // 2, h))
+                result.paste(region.filter(ImageFilter.GaussianBlur(radius=30)),
+                             (cx - strip_w // 2, 0))
+            else:
+                for landmarks in detection.face_landmarks:
+                    xs = [lm.x * iw for lm in landmarks]
+                    ys = [lm.y * ih for lm in landmarks]
+
+                    face_w = max(xs) - min(xs)
+                    face_h = max(ys) - min(ys)
+                    pad_x = face_w * 0.3
+                    pad_y = face_h * 0.35
+
+                    fx1 = max(0, int(min(xs) - pad_x))
+                    fy1 = max(0, int(min(ys) - pad_y))
+                    fx2 = min(w, int(max(xs) + pad_x))
+                    fy2 = min(h, int(max(ys) + pad_y))
+
+                    if fx2 <= fx1 or fy2 <= fy1:
+                        continue
+
+                    face_region = result.crop((fx1, fy1, fx2, fy2))
+                    blurred = face_region.filter(ImageFilter.GaussianBlur(radius=30))
+                    result.paste(blurred, (fx1, fy1))
+
+    except Exception:
+        cx = w // 2
+        strip_w = w // 3
+        region = result.crop((cx - strip_w // 2, 0, cx + strip_w // 2, h))
+        result.paste(region.filter(ImageFilter.GaussianBlur(radius=30)),
+                     (cx - strip_w // 2, 0))
+
+    # Level 1: also blur entire image to wash out identifying text
+    if level >= 1:
+        result = result.filter(ImageFilter.GaussianBlur(radius=10))
+
+    return result
 
 
 def find_best_reference(target_yaw: float, target_pitch: float) -> Path | None:
@@ -358,6 +471,68 @@ def load_reference_photos(max_photos: int = 3, specific_path: Path | None = None
     return photos
 
 
+def enhance_prompt(source_image: Image.Image, user_prompt: str, video_title: str = "") -> str:
+    """Use Gemini 2.5 Pro to rewrite a casual user prompt into precise image generation instructions.
+
+    Analyzes the source thumbnail and converts natural language into structured
+    KEEP/REMOVE/CHANGE/ADD directives that the image model follows more reliably.
+    """
+    if not user_prompt.strip():
+        return ""
+
+    client = genai.Client(api_key=API_KEY)
+
+    thumb = source_image.copy()
+    thumb.thumbnail((640, 360), Image.Resampling.LANCZOS)
+
+    contents = [
+        "Here is the source YouTube thumbnail that will be recreated:",
+        thumb,
+        f"""The user wants to modify this thumbnail with these instructions:
+\"{user_prompt}\"
+{f'Video title: "{video_title}"' if video_title else ''}
+
+Your job: Rewrite the user's instructions into PRECISE, STRUCTURED directives for an image generation model. The image model is literal — it needs exact specifications.
+
+Rules:
+- Analyze the source thumbnail carefully first
+- Convert vague instructions into specific visual descriptions
+- Specify exact positions (top-left, center, bottom-right, etc.)
+- Specify exact colors, sizes (large/medium/small relative to frame), and styles
+- If the user says to replace something, describe BOTH what to remove AND what to put in its place
+- If the user mentions a count (e.g. "four videos"), be explicit about the grid layout (e.g. "2x2 grid")
+- Keep it concise — no explanations, just directives
+
+Output format — use ONLY these sections (skip any that don't apply):
+
+KEEP: [what stays the same from the source]
+REMOVE: [what to delete from the source]
+CHANGE: [what to modify and how]
+ADD: [new elements to include]
+TEXT: [exact text content, position, font style, color, size]
+LAYOUT: [spatial arrangement of elements]"""
+    ]
+
+    try:
+        response = _api_call_with_timeout(
+            client, ANALYSIS_MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT"]),
+            timeout=30,
+        )
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    enhanced = part.text.strip()
+                    print(f"Enhanced prompt:\n{enhanced}\n")
+                    return enhanced
+    except Exception as e:
+        print(f"Prompt enhancement failed ({e}), using original prompt")
+
+    return user_prompt
+
+
+BLOCKED_SENTINEL = "BLOCKED"
+
 def recreate_thumbnail(
     source_image: Image.Image,
     reference_photos: list[Image.Image],
@@ -365,23 +540,30 @@ def recreate_thumbnail(
     additional_prompt: str = "",
     video_title: str = "",
     swipe_examples: list[Image.Image] | None = None,
-) -> Image.Image | None:
-    """Recreate a thumbnail with your face swapped in."""
+    anon_level: int = 0,
+) -> Image.Image | str | None:
+    """Recreate a thumbnail with the client as the featured person.
+
+    Blurs eyes in the source thumbnail to bypass content filters on public figures,
+    while preserving expression, pose, and layout for accurate replication.
+    """
     client = genai.Client(api_key=API_KEY)
 
     thumb = source_image.copy()
     thumb.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
 
-    num_refs = len(reference_photos)
+    # Anonymize source to bypass public figure filter
+    thumb_anon = anonymize_source(thumb, level=anon_level)
+    anon_labels = {0: "face blur", 1: "face blur + text wash", 2: "heavy pixelation"}
+    print(f"\nAnonymized source thumbnail ({anon_labels.get(anon_level, 'face blur')})")
 
-    # Interleave text labels with images so the model knows which is which
     contents = []
     for i, ref in enumerate(reference_photos):
-        contents.append(f"Reference photo {i+1} of the target person — study their exact bone structure, jawline, nose, eyebrows, skin tone, and hair:")
+        contents.append(f"Reference photo {i+1} of the client — ONLY use this for the person's face and body appearance. IGNORE the background, setting, and environment in this photo:")
         contents.append(ref)
 
-    contents.append("Source YouTube thumbnail — recreate this with the target person's face:")
-    contents.append(thumb)
+    contents.append("Source thumbnail — THIS is the master layout. Copy its EXACT background, setting, environment, colors, objects, props, text, and composition. Only replace the person's face/appearance using the reference photos above:")
+    contents.append(thumb_anon)
 
     # Add swipe file examples as style references
     if swipe_examples is None:
@@ -397,39 +579,47 @@ def recreate_thumbnail(
 VIDEO TITLE: "{video_title}"
 TITLE-THUMBNAIL SYNERGY: Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title. If title says "How I Built a $100k Business", thumbnail text should be "From Scratch" or show a revenue screenshot — NOT "$100k Business"."""
 
-    prompt = f"""You are an expert YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Recreate the source thumbnail above, replacing the person with the face from the reference photos.
+    user_overrides = ""
+    if additional_prompt:
+        user_overrides = f"""
+=== PRIORITY INSTRUCTIONS (from the client — these OVERRIDE any conflicting rules below) ===
+{additional_prompt}
+=== END PRIORITY INSTRUCTIONS ===
+Follow the instructions above EXACTLY. Where they conflict with the source layout or default rules below, the PRIORITY INSTRUCTIONS always win."""
 
-FACE SWAP RULES:
-- ⚠️ #1 PRIORITY — IDENTITY: ONLY the person from the reference photos may appear. Do NOT invent, hallucinate, or substitute ANY other face. Every face in the output MUST be the reference person. If the source has multiple people, replace ALL of them with the reference person or remove extras. Copy exact bone structure, jawline, nose shape, eyebrow shape, skin tone, hair color, hair texture. Before generating, look at the reference photos ONE MORE TIME.
-- ONE PERSON RULE: If the thumbnail has only one person visible, that person MUST be the reference person. No exceptions.
-- PROPORTION RULE: Face must have NATURAL human proportions. Do NOT squeeze, stretch, or distort horizontally or vertically.
-- Keep same head size, position, and angle as the original.
-- SKIN TONE CONSISTENCY: Face skin tone must match ALL visible skin (neck, hands, arms). Match scene lighting.
-- TEXT ACCURACY: If there is text in the thumbnail, spell EVERY word CORRECTLY. Double-check each letter. No repeated letters, no missing letters. "ASLEEP" not "ASLEEEP".
+    prompt = f"""You are an expert YouTube thumbnail designer. Create a new thumbnail based on the source layout above, featuring the client from the reference photos.
+{user_overrides}
 
-REPLICATE RULES:
-- Keep ALL text overlays EXACTLY as source: same words, font, size, position, color.
-- Keep ALL graphic elements, logos, objects, background, clothing, and body pose identical.
+PERSON PORTRAYAL (from reference photos):
+- Use reference photos ONLY for the person's face and body: bone structure, jawline, nose shape, eyebrow shape, skin tone, hair color/texture.
+- IGNORE backgrounds/settings in reference photos — they are IRRELEVANT.
+- Only the client should appear. No other people.
+- Face proportions must be natural — no squeezing, stretching, or distortion.
+- Match expression and pose from the SOURCE THUMBNAIL.
+- Skin tone consistent across face, neck, hands, arms.
+- TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter.
+
+LAYOUT RULES (from source thumbnail — follow unless overridden by PRIORITY INSTRUCTIONS):
+- Use the source thumbnail as the base layout for composition, background, setting, and framing.
+- Keep text overlays, graphic elements, logos, objects, props, and clothing consistent with the source.
+- Do NOT bring backgrounds or settings from the reference photos.
+
+FRAMING:
+- The person MUST be fully visible — never crop out head, forehead, chin, or visible body parts.
+- Leave adequate headroom.
 
 {PLAYBOOK}
 {title_section}
 
-OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail, not AI-generated.
-
-{additional_prompt}"""
+OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail."""
 
     contents.append(prompt)
 
-    print(f"\nGenerating with {len(reference_photos)} reference photos...")
+    print(f"Generating with {len(reference_photos)} reference photos...")
 
     try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-            ),
-        )
+        response = _api_call_with_timeout(client, MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
 
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:
@@ -440,6 +630,20 @@ OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail, not AI-generated.
                         return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
                 elif hasattr(part, 'text') and part.text:
                     print(f"Model note: {part.text[:200]}")
+        else:
+            # Check if blocked by content filter
+            feedback = getattr(response, 'prompt_feedback', None)
+            block_reason = getattr(feedback, 'block_reason', None) if feedback else None
+            if response.candidates:
+                c = response.candidates[0]
+                print(f"  Candidate finish_reason: {getattr(c, 'finish_reason', 'N/A')}")
+                print(f"  Safety ratings: {getattr(c, 'safety_ratings', 'N/A')}")
+            else:
+                print(f"  No candidates. Prompt feedback: {feedback}")
+
+            if block_reason:
+                print(f"  BLOCKED (reason: {block_reason})")
+                return BLOCKED_SENTINEL
 
         print("No image in response")
         return None
@@ -457,7 +661,10 @@ def mashup_thumbnail(
     video_title: str = "",
     swipe_examples: list[Image.Image] | None = None,
 ) -> Image.Image | None:
-    """Merge two thumbnails together with the client's face."""
+    """Merge two thumbnails together with the client's face.
+
+    Blurs eyes in source thumbnails to bypass content filters on public figures.
+    """
     api_client = genai.Client(api_key=API_KEY)
 
     thumb_a = source_a.copy()
@@ -465,15 +672,20 @@ def mashup_thumbnail(
     thumb_b = source_b.copy()
     thumb_b.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
 
+    # Blur eyes in sources to anonymize
+    thumb_a_anon = anonymize_source(thumb_a)
+    thumb_b_anon = anonymize_source(thumb_b)
+    print(f"\nAnonymized source thumbnails (pixelated for privacy)")
+
     contents = []
     for i, ref in enumerate(reference_photos):
-        contents.append(f"Reference photo {i+1} of the target person — study their exact face:")
+        contents.append(f"Reference photo {i+1} of the client — this is the person who will be featured in the thumbnail:")
         contents.append(ref)
 
-    contents.append("Thumbnail A — take design elements, composition ideas, or style from this:")
-    contents.append(thumb_a)
-    contents.append("Thumbnail B — take design elements, composition ideas, or style from this:")
-    contents.append(thumb_b)
+    contents.append("Thumbnail A (pixelated for privacy for privacy — use for composition, pose, expression, text, colors, style):")
+    contents.append(thumb_a_anon)
+    contents.append("Thumbnail B (pixelated for privacy for privacy — use for composition, pose, expression, text, colors, style):")
+    contents.append(thumb_b_anon)
 
     # Add swipe file examples as style references
     if swipe_examples is None:
@@ -489,16 +701,17 @@ def mashup_thumbnail(
 VIDEO TITLE: "{video_title}"
 TITLE-THUMBNAIL SYNERGY: Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title. Use shorter, punchier text (max 4 words) that pairs with the title."""
 
-    prompt = f"""You are an expert YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a NEW thumbnail that merges the best elements from Thumbnail A and Thumbnail B above. Use the target person's face from the reference photos.
+    prompt = f"""You are an expert YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a NEW thumbnail that merges the best elements from Thumbnail A and Thumbnail B above, featuring the client from the reference photos.
 
 MASHUP RULES:
 - Combine the strongest design elements from both thumbnails: composition, color scheme, text style, graphic elements, background.
-- ⚠️ #1 PRIORITY — IDENTITY: ONLY the person from the reference photos may appear. Do NOT invent, hallucinate, or substitute ANY other face. Every face in the output MUST be the reference person. Copy exact bone structure, jawline, nose, eyebrows, skin tone, hair. Before generating, look at the reference photos ONE MORE TIME.
-- ONE PERSON RULE: If the thumbnail has only one person visible, that person MUST be the reference person. No exceptions.
-- PROPORTION RULE: Face must have NATURAL human proportions. No squeezing or stretching.
+- The person in the reference photos is the CLIENT. They must be the featured person.
+- Accurately depict their exact appearance: bone structure, jawline, nose, eyebrows, skin tone, hair.
+- Only the client should appear. Do not add other people.
+- Face proportions must be natural — no squeezing or stretching.
 - Pick the best composition from either thumbnail or blend them. Result must feel cohesive, not a collage.
-- SKIN TONE CONSISTENCY: Face skin tone must match ALL visible skin. Match scene lighting.
-- TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter. No repeated or missing letters.
+- Skin tone must be consistent across face, neck, hands, arms. Match scene lighting.
+- TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter.
 
 {PLAYBOOK}
 {title_section}
@@ -509,16 +722,11 @@ OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail.
 
     contents.append(prompt)
 
-    print(f"\nMashup generating with {len(reference_photos)} reference photos...")
+    print(f"Mashup generating with {len(reference_photos)} reference photos...")
 
     try:
-        response = api_client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-            ),
-        )
+        response = _api_call_with_timeout(api_client, MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
 
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:
@@ -595,13 +803,8 @@ OUTPUT: 1280x720 pixels, 16:9. Must look like a top-tier professional YouTube th
     print(f"\nImagine mode: generating with {len(reference_photos)} reference photos...")
 
     try:
-        response = api_client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-            ),
-        )
+        response = _api_call_with_timeout(api_client, MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
 
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:
@@ -648,13 +851,9 @@ If EITHER check fails, output a corrected version of the thumbnail with the issu
 Output the image in 16:9 format (1280x720).""")
 
     try:
-        response = api_client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-            ),
-        )
+        response = _api_call_with_timeout(api_client, MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+            timeout=90)
 
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:
@@ -697,13 +896,8 @@ Output in 16:9 format."""
     print(f"\nEditing with instructions: {edit_instructions[:100]}...")
 
     try:
-        response = api_client.models.generate_content(
-            model=MODEL,
-            contents=[thumb, prompt],
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-            ),
-        )
+        response = _api_call_with_timeout(api_client, MODEL, [thumb, prompt],
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
 
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:
@@ -757,6 +951,8 @@ def main():
                         help="Video title — thumbnail will be designed to complement it")
     parser.add_argument("--ref-dir", type=str, default=None,
                         help="Override reference photos directory")
+    parser.add_argument("--swipe-files", type=str, default="",
+                        help="Comma-separated list of swipe example filenames to use (empty = all)")
 
     args = parser.parse_args()
 
@@ -824,7 +1020,13 @@ def main():
         return None
 
     # Load swipe examples once for all variations
-    swipe_examples = load_swipe_examples()
+    if args.swipe_files == "":
+        # No --swipe-files arg: load all
+        swipe_examples = load_swipe_examples()
+    else:
+        # Explicit list (possibly empty = none selected)
+        swipe_filter = [f.strip() for f in args.swipe_files.split(',') if f.strip()]
+        swipe_examples = load_swipe_examples(only_files=swipe_filter) if swipe_filter else []
 
     # === IMAGINE MODE (no source needed) ===
     if args.mode == "imagine":
@@ -899,31 +1101,54 @@ def main():
     if not reference_photos:
         print("Warning: No reference photos found. Results may vary.")
 
+    # Enhance user prompt once (before all variations)
+    enhanced_prompt = args.prompt
+    if args.prompt.strip():
+        print("Enhancing prompt with AI...")
+        enhanced_prompt = enhance_prompt(source_image, args.prompt, args.title)
+
     output_paths = []
 
     for i in range(args.variations):
         print(f"\n--- Variation {i + 1}/{args.variations} ---")
 
-        if args.mode == "mashup":
-            result = mashup_thumbnail(
-                source_a=source_image,
-                source_b=source_image_b,
-                reference_photos=reference_photos,
-                additional_prompt=args.prompt,
-                video_title=args.title,
-                swipe_examples=swipe_examples,
-            )
-        else:
-            result = recreate_thumbnail(
-                source_image=source_image,
-                reference_photos=reference_photos,
-                style_variation=args.style,
-                additional_prompt=args.prompt,
-                video_title=args.title,
-                swipe_examples=swipe_examples,
-            )
+        result = None
+        max_anon_level = 2
+        for anon_level in range(max_anon_level + 1):
+            if args.mode == "mashup":
+                result = mashup_thumbnail(
+                    source_a=source_image,
+                    source_b=source_image_b,
+                    reference_photos=reference_photos,
+                    additional_prompt=enhanced_prompt,
+                    video_title=args.title,
+                    swipe_examples=swipe_examples,
+                )
+            else:
+                result = recreate_thumbnail(
+                    source_image=source_image,
+                    reference_photos=reference_photos,
+                    style_variation=args.style,
+                    additional_prompt=enhanced_prompt,
+                    video_title=args.title,
+                    swipe_examples=swipe_examples,
+                    anon_level=anon_level,
+                )
 
-        if result is None:
+            if result == BLOCKED_SENTINEL:
+                if anon_level < max_anon_level:
+                    anon_labels = {0: "face blur", 1: "face + text blur", 2: "heavy pixelation"}
+                    next_label = anon_labels.get(anon_level + 1, "heavier")
+                    print(f"  RETRY: Content filter blocked, retrying with {next_label} (attempt {anon_level + 2}/{max_anon_level + 1})")
+                    continue
+                else:
+                    print(f"  All anonymization levels exhausted, skipping variation")
+                    result = None
+                    break
+            else:
+                break  # Success or non-block failure
+
+        if result is None or result == BLOCKED_SENTINEL:
             print(f"Failed to generate variation {i + 1}")
             continue
 

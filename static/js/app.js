@@ -53,7 +53,9 @@ function dismissToast(btn) {
 }
 
 function copyToastError(btn) {
-    const message = btn.closest('.toast-body').querySelector('.toast-message').textContent;
+    const toastMsg = btn.closest('.toast-body').querySelector('.toast-message');
+    // Use innerText (not textContent) and trim to get only the visible error message
+    const message = (toastMsg.innerText || toastMsg.textContent || '').trim();
     navigator.clipboard.writeText(message).then(() => {
         btn.textContent = 'Copied!';
         setTimeout(() => { btn.textContent = 'Copy Error'; }, 1500);
@@ -264,7 +266,200 @@ function closeResult() {
 
 // ─── THUMBNAILS ──────────────────────────────────────────────────────────────
 
+function addGenerationGroup(paths, label, meta) {
+    const placeholder = document.getElementById('previewPlaceholder');
+    const grid = document.getElementById('previewGrid');
+    if (!grid || !paths.length) return;
+
+    placeholder.classList.add('hidden');
+    grid.classList.remove('hidden');
+
+    if (!window._thumbPaths) window._thumbPaths = [];
+    const startIdx = window._thumbPaths.length;
+    window._thumbPaths.push(...paths);
+
+    // Build source thumbnail: from saved file, or derive from YouTube URL
+    let sourceSrc = '';
+    if (meta && meta.source_thumb) {
+        sourceSrc = `/api/download/${meta.source_thumb}`;
+    } else if (meta && meta.youtube_url) {
+        const m = meta.youtube_url.match(/(?:youtu\.be\/|[?&]v=)([A-Za-z0-9_-]{11})/);
+        if (m) sourceSrc = `https://img.youtube.com/vi/${m[1]}/hqdefault.jpg`;
+    }
+
+    // Build meta details HTML
+    let metaHtml = '';
+    if (meta) {
+        const pills = [];
+        if (meta.mode) pills.push(`<span class="gen-meta-pill">${escapeHtml(meta.mode)}</span>`);
+        if (meta.client) pills.push(`<span class="gen-meta-pill">${escapeHtml(meta.client)}</span>`);
+        if (meta.variations) pills.push(`<span class="gen-meta-pill">${meta.variations} vars</span>`);
+
+        metaHtml = `<div class="gen-meta-panel hidden">
+            ${sourceSrc ? `<div class="gen-meta-source"><img src="${sourceSrc}" alt="Source thumbnail"><span class="gen-meta-source-label">Source</span></div>` : ''}
+            <div class="gen-meta-details">
+                ${pills.length ? `<div class="gen-meta-pills">${pills.join('')}</div>` : ''}
+                ${meta.video_title ? `<div class="gen-meta-row"><span class="gen-meta-key">Title</span><span class="gen-meta-val">${escapeHtml(meta.video_title)}</span></div>` : ''}
+                ${meta.prompt ? `<div class="gen-meta-row"><span class="gen-meta-key">Prompt</span><span class="gen-meta-val">${escapeHtml(meta.prompt)}</span></div>` : ''}
+                ${meta.youtube_url ? `<div class="gen-meta-row"><span class="gen-meta-key">URL</span><span class="gen-meta-val gen-meta-url">${escapeHtml(meta.youtube_url)}</span></div>` : ''}
+            </div>
+        </div>`;
+    }
+
+    const hasMeta = !!metaHtml;
+    const group = document.createElement('div');
+    group.className = 'generation-group';
+    group.innerHTML = `
+        <div class="generation-header${hasMeta ? ' clickable' : ''}">
+            <span>Generated ${label}</span>
+            ${hasMeta ? '<span class="gen-meta-chevron">&#9662;</span>' : ''}
+        </div>
+        ${metaHtml}
+        ${sourceSrc ? `<div class="gen-source-row">
+            <div class="thumb-result-item thumb-source-item">
+                <img src="${sourceSrc}" alt="Source thumbnail" data-full-src="${sourceSrc}">
+                <span class="thumb-source-badge">Source</span>
+            </div>
+        </div>` : ''}
+        <div class="generation-thumbs">
+            ${paths.map((path, i) =>
+                `<div class="thumb-result-item" data-index="${startIdx + i}">
+                    <img src="/api/download/${path}" alt="Generated thumbnail">
+                    <a href="/api/download/${path}" download class="thumb-download-btn">Download</a>
+                </div>`
+            ).join('')}
+        </div>
+        <div class="gen-regen-bar">
+            <button class="gen-regen-btn">Regenerate</button>
+        </div>
+    `;
+
+    // Click header row to toggle meta panel
+    const header = group.querySelector('.generation-header');
+    const panel = group.querySelector('.gen-meta-panel');
+    if (header && panel) {
+        header.addEventListener('click', () => {
+            panel.classList.toggle('hidden');
+            header.classList.toggle('expanded');
+        });
+    }
+
+    // Regenerate: load ALL original settings back into the form and scroll to it
+    const regenBtn = group.querySelector('.gen-regen-btn');
+    regenBtn.addEventListener('click', () => {
+        if (meta) {
+            // Source URL
+            if (meta.youtube_url) {
+                const urlEl = document.getElementById('youtubeUrl');
+                if (urlEl) { urlEl.value = meta.youtube_url; urlEl.dispatchEvent(new Event('input')); }
+            }
+            // Video title
+            if (meta.video_title) {
+                const titleEl = document.getElementById('videoTitle');
+                if (titleEl) titleEl.value = meta.video_title;
+            }
+            // Client
+            if (meta.client) {
+                const clientEl = document.getElementById('clientSelect');
+                if (clientEl) { clientEl.value = meta.client; clientEl.dispatchEvent(new Event('change')); }
+            }
+            // Prompt
+            if (meta.prompt) {
+                const promptEl = document.getElementById('thumbPrompt');
+                if (promptEl) promptEl.value = meta.prompt;
+            }
+            // Variations slider
+            if (meta.variations) {
+                const varEl = document.getElementById('variations');
+                const varVal = document.getElementById('variationsValue');
+                if (varEl) { varEl.value = meta.variations; if (varVal) varVal.textContent = String(meta.variations).padStart(2, '0'); }
+            }
+            // Refs slider
+            if (meta.refs) {
+                const refsEl = document.getElementById('refs');
+                const refsVal = document.getElementById('refsValue');
+                if (refsEl) { refsEl.value = meta.refs; if (refsVal) refsVal.textContent = String(meta.refs).padStart(2, '0'); }
+            }
+            // Swipe file selections
+            if (meta.swipe_files !== undefined) {
+                const savedSwipes = new Set(meta.swipe_files.split(',').filter(s => s));
+                document.querySelectorAll('#swipePickerGrid .swipe-pick-item').forEach(item => {
+                    const name = item.dataset.name;
+                    if (savedSwipes.has(name)) {
+                        item.classList.add('selected');
+                        if (window._swipeSelections) window._swipeSelections.add(name);
+                    } else {
+                        item.classList.remove('selected');
+                        if (window._swipeSelections) window._swipeSelections.delete(name);
+                    }
+                });
+            }
+        }
+        // Scroll to the prompt field so user can edit and hit Generate
+        const promptEl = document.getElementById('thumbPrompt');
+        if (promptEl) {
+            promptEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            promptEl.focus();
+        }
+    });
+
+    // Source thumbnail click — open in lightbox
+    const sourceImg = group.querySelector('.thumb-source-item img');
+    if (sourceImg) {
+        const src = sourceImg.getAttribute('data-full-src');
+        // Add source to _thumbPaths so lightbox can show it
+        const sourceIdx = window._thumbPaths.length;
+        window._thumbPaths.push(src);
+        sourceImg.addEventListener('click', () => openLightbox(sourceIdx));
+    }
+
+    group.querySelectorAll('.generation-thumbs .thumb-result-item img').forEach(img => {
+        img.addEventListener('click', (e) => {
+            const idx = parseInt(e.target.closest('.thumb-result-item').dataset.index);
+            openLightbox(idx);
+        });
+    });
+
+    return group;
+}
+
+async function loadThumbnailHistory() {
+    try {
+        const res = await fetch('/api/thumbnails/history');
+        const groups = await res.json();
+        if (!groups.length) return;
+
+        const grid = document.getElementById('previewGrid');
+        // Append in order (already newest-first from API)
+        for (const g of groups) {
+            const el = addGenerationGroup(g.paths, g.label, g.meta || null);
+            if (el) grid.appendChild(el);
+        }
+
+        // Show clear history button
+        let clearBtn = document.getElementById('clearHistoryBtn');
+        if (!clearBtn) {
+            const placeholder = document.getElementById('previewPlaceholder');
+            clearBtn = document.createElement('button');
+            clearBtn.id = 'clearHistoryBtn';
+            clearBtn.className = 'clear-history-btn';
+            clearBtn.textContent = 'Clear History';
+            clearBtn.addEventListener('click', () => {
+                grid.innerHTML = '';
+                grid.classList.add('hidden');
+                placeholder.classList.remove('hidden');
+                window._thumbPaths = [];
+                clearBtn.remove();
+            });
+            grid.parentElement.querySelector('.preview-dots').appendChild(clearBtn);
+        }
+    } catch (err) {
+        // Silent fail — history is non-critical
+    }
+}
+
 function initThumbnails() {
+    window._thumbPaths = [];
     const btnYoutube = document.getElementById('btnYoutube');
     const btnUpload = document.getElementById('btnUpload');
     const youtubeInput = document.getElementById('youtubeInput');
@@ -436,6 +631,31 @@ function initThumbnails() {
         uploadInput.classList.add('hidden');
     });
 
+    // Thumbnail preview on URL paste/input
+    function extractVideoId(url) {
+        const m = url.match(/(?:youtu\.be\/|[?&]v=)([A-Za-z0-9_-]{11})/);
+        return m ? m[1] : null;
+    }
+
+    function showThumbPreview(inputEl, previewEl, imgEl) {
+        const vid = extractVideoId(inputEl.value);
+        if (vid) {
+            imgEl.src = `https://img.youtube.com/vi/${vid}/maxresdefault.jpg`;
+            imgEl.onerror = () => {
+                imgEl.src = `https://img.youtube.com/vi/${vid}/hqdefault.jpg`;
+            };
+            previewEl.classList.remove('hidden');
+        } else {
+            previewEl.classList.add('hidden');
+        }
+    }
+
+    const urlInput = document.getElementById('youtubeUrl');
+    const thumbPreview = document.getElementById('thumbPreview');
+    const thumbPreviewImg = document.getElementById('thumbPreviewImg');
+    urlInput.addEventListener('input', () => showThumbPreview(urlInput, thumbPreview, thumbPreviewImg));
+    urlInput.addEventListener('paste', () => setTimeout(() => showThumbPreview(urlInput, thumbPreview, thumbPreviewImg), 0));
+
     btnUpload.addEventListener('click', () => {
         btnUpload.classList.add('active');
         btnYoutube.classList.remove('active');
@@ -477,6 +697,15 @@ function initThumbnails() {
             youtubeInput2.classList.add('hidden');
         });
     }
+    // Thumbnail preview for source B (mashup)
+    const urlInput2 = document.getElementById('youtubeUrl2');
+    const thumbPreview2 = document.getElementById('thumbPreview2');
+    const thumbPreviewImg2 = document.getElementById('thumbPreviewImg2');
+    if (urlInput2 && thumbPreview2) {
+        urlInput2.addEventListener('input', () => showThumbPreview(urlInput2, thumbPreview2, thumbPreviewImg2));
+        urlInput2.addEventListener('paste', () => setTimeout(() => showThumbPreview(urlInput2, thumbPreview2, thumbPreviewImg2), 0));
+    }
+
     if (thumbUploadZone2) {
         thumbUploadZone2.addEventListener('click', () => thumbFile2.click());
         thumbFile2.addEventListener('change', () => {
@@ -515,6 +744,66 @@ function initThumbnails() {
         clientSelect.addEventListener('change', () => {
             generateBtn.disabled = !clientSelect.value;
         });
+    }
+
+    // ─── Swipe File Picker ──────────────────────────────────────────
+    loadSwipePicker();
+
+    // ─── Load Previous Thumbnails ────────────────────────────────────
+    loadThumbnailHistory();
+}
+
+async function loadSwipePicker() {
+    const grid = document.getElementById('swipePickerGrid');
+    const selectAll = document.getElementById('swipeSelectAll');
+    const selectNone = document.getElementById('swipeSelectNone');
+    if (!grid) return;
+
+    try {
+        const res = await fetch('/api/swipe-examples');
+        const examples = await res.json();
+        if (!examples.length) {
+            grid.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">No swipe examples found</p>';
+            return;
+        }
+
+        window._swipeSelections = new Set(); // none selected by default
+        grid.innerHTML = examples.map(ex =>
+            `<div class="swipe-pick-item" data-name="${ex.name}">
+                <img src="${ex.url}" alt="${ex.name}" loading="lazy">
+                <div class="swipe-pick-check">\u2713</div>
+            </div>`
+        ).join('');
+
+        // Toggle on click
+        grid.querySelectorAll('.swipe-pick-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const name = item.dataset.name;
+                if (item.classList.contains('selected')) {
+                    item.classList.remove('selected');
+                    window._swipeSelections.delete(name);
+                } else {
+                    item.classList.add('selected');
+                    window._swipeSelections.add(name);
+                }
+            });
+        });
+
+        // Select all / none
+        selectAll.addEventListener('click', () => {
+            grid.querySelectorAll('.swipe-pick-item').forEach(item => {
+                item.classList.add('selected');
+                window._swipeSelections.add(item.dataset.name);
+            });
+        });
+        selectNone.addEventListener('click', () => {
+            grid.querySelectorAll('.swipe-pick-item').forEach(item => {
+                item.classList.remove('selected');
+            });
+            window._swipeSelections.clear();
+        });
+    } catch (err) {
+        grid.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">Failed to load swipe examples</p>';
     }
 }
 
@@ -562,6 +851,11 @@ async function generateThumbnails() {
     formData.append('skip_match', document.getElementById('skipMatch').checked);
     formData.append('prompt', document.getElementById('thumbPrompt').value);
     formData.append('video_title', document.getElementById('videoTitle').value);
+
+    // Send selected swipe examples (always send — empty string means "none")
+    if (window._swipeSelections) {
+        formData.append('swipe_files', Array.from(window._swipeSelections).join(','));
+    }
     formData.append('client', document.getElementById('clientSelect').value);
 
     try {
@@ -601,24 +895,43 @@ async function pollThumbnailProgress(taskId) {
             if (data.state === 'done') {
                 overlay.classList.add('hidden');
 
-                // Show generated thumbnails
                 if (data.thumbnails && data.thumbnails.length) {
-                    placeholder.classList.add('hidden');
-                    grid.classList.remove('hidden');
-                    window._thumbPaths = data.thumbnails;
-                    grid.innerHTML = data.thumbnails.map((path, i) =>
-                        `<div class="thumb-result-item" data-index="${i}">
-                            <img src="/api/download/${path}" alt="Generated thumbnail">
-                            <a href="/api/download/${path}" download class="thumb-download-btn">Download</a>
-                        </div>`
-                    ).join('');
-                    // Click to open lightbox
-                    grid.querySelectorAll('.thumb-result-item img').forEach(img => {
-                        img.addEventListener('click', (e) => {
-                            const idx = parseInt(e.target.closest('.thumb-result-item').dataset.index);
-                            openLightbox(idx);
-                        });
-                    });
+                    const now = new Date();
+                    const timeStr = now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                    // Capture current form state as meta
+                    const liveMeta = {
+                        mode: window._thumbMode || 'replicate',
+                        youtube_url: document.getElementById('youtubeUrl')?.value || '',
+                        prompt: document.getElementById('thumbPrompt')?.value || '',
+                        video_title: document.getElementById('videoTitle')?.value || '',
+                        client: document.getElementById('clientSelect')?.value || '',
+                        variations: document.getElementById('variations')?.value || '',
+                        refs: document.getElementById('refs')?.value || '',
+                        swipe_files: window._swipeSelections ? Array.from(window._swipeSelections).join(',') : '',
+                    };
+                    const group = addGenerationGroup(data.thumbnails, timeStr, liveMeta);
+                    if (group) {
+                        grid.prepend(group);
+
+                        // Show clear history button
+                        let clearBtn = document.getElementById('clearHistoryBtn');
+                        if (!clearBtn) {
+                            clearBtn = document.createElement('button');
+                            clearBtn.id = 'clearHistoryBtn';
+                            clearBtn.className = 'clear-history-btn';
+                            clearBtn.textContent = 'Clear History';
+                            clearBtn.addEventListener('click', () => {
+                                grid.innerHTML = '';
+                                grid.classList.add('hidden');
+                                placeholder.classList.remove('hidden');
+                                window._thumbPaths = [];
+                                clearBtn.remove();
+                            });
+                            grid.parentElement.querySelector('.preview-dots').appendChild(clearBtn);
+                        }
+                        // Scroll to the new generation
+                        group.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
                 }
                 return;
             }
@@ -642,6 +955,12 @@ async function pollThumbnailProgress(taskId) {
 
 let _lightboxIndex = 0;
 
+function thumbSrc(path) {
+    // If it's already a full URL or starts with /, use as-is; otherwise prepend /api/download/
+    if (path.startsWith('http') || path.startsWith('/')) return path;
+    return `/api/download/${path}`;
+}
+
 function openLightbox(index) {
     _lightboxIndex = index;
     const paths = window._thumbPaths || [];
@@ -650,16 +969,17 @@ function openLightbox(index) {
     const existing = document.querySelector('.lightbox-overlay');
     if (existing) existing.remove();
 
+    const src = thumbSrc(paths[index]);
     const overlay = document.createElement('div');
     overlay.className = 'lightbox-overlay';
     overlay.innerHTML = `
         <div class="lightbox-container">
             <button class="lightbox-arrow lightbox-prev">&lsaquo;</button>
-            <img class="lightbox-img" src="/api/download/${paths[index]}" alt="Thumbnail preview">
+            <img class="lightbox-img" src="${src}" alt="Thumbnail preview">
             <button class="lightbox-arrow lightbox-next">&rsaquo;</button>
             <button class="lightbox-close">&times;</button>
             <span class="lightbox-counter">${index + 1} / ${paths.length}</span>
-            <a class="lightbox-download" href="/api/download/${paths[index]}" download>Download</a>
+            <a class="lightbox-download" href="${src}" download>Download</a>
         </div>
     `;
 
@@ -684,9 +1004,10 @@ function navigateLightbox(dir) {
     const overlay = document.querySelector('.lightbox-overlay');
     if (!overlay) return;
 
-    overlay.querySelector('.lightbox-img').src = `/api/download/${paths[_lightboxIndex]}`;
+    const src = thumbSrc(paths[_lightboxIndex]);
+    overlay.querySelector('.lightbox-img').src = src;
     overlay.querySelector('.lightbox-counter').textContent = `${_lightboxIndex + 1} / ${paths.length}`;
-    overlay.querySelector('.lightbox-download').href = `/api/download/${paths[_lightboxIndex]}`;
+    overlay.querySelector('.lightbox-download').href = src;
 }
 
 function closeLightbox() {

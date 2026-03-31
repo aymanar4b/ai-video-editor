@@ -86,6 +86,9 @@
                         <input type="text" id="youtubeUrl" class="text-input" placeholder="https://youtube.com/watch?v=...">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="input-icon"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
                     </div>
+                    <div id="thumbPreview" class="thumb-url-preview hidden">
+                        <img id="thumbPreviewImg" alt="Thumbnail preview">
+                    </div>
                 </div>
 
                 <div id="uploadInput" class="hidden">
@@ -114,6 +117,9 @@
                     <div class="input-with-icon">
                         <input type="text" id="youtubeUrl2" class="text-input" placeholder="https://youtube.com/watch?v=... (second thumbnail)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="input-icon"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                    </div>
+                    <div id="thumbPreview2" class="thumb-url-preview hidden">
+                        <img id="thumbPreviewImg2" alt="Thumbnail preview">
                     </div>
                 </div>
 
@@ -159,8 +165,27 @@
             <p class="field-hint">Title + thumbnail work together — the AI ensures they complement, not repeat.</p>
 
             <label class="field-label" style="margin-top: 12px;">ADDITIONAL INSTRUCTIONS</label>
-            <textarea id="thumbPrompt" class="text-area" rows="4" placeholder="e.g. 'Make expression confident and serious' or 'Boost contrast, make text pop more' or 'Match the Diary of a CEO style — white text, red highlight, dark background'"></textarea>
+            <textarea id="thumbPrompt" class="text-area" rows="4" placeholder="Be specific about what to change from the source. e.g:&#10;• Text should say 'BEST' then YouTube logo then 'FORMATS'&#10;• Replace vertical images with 4 blurred 16:9 YouTube videos&#10;• YouTube logo must be red, text white bold"></textarea>
+            <p class="field-hint">These override the source layout. Be specific: describe exact text, colors, counts, and sizes. Vague prompts get vague results.</p>
+        </div>
 
+        <!-- Swipe File Inspiration Picker -->
+        <div class="thumb-form-card">
+            <div class="swipe-header">
+                <label class="field-label coral">STYLE INSPIRATION</label>
+                <div class="swipe-actions">
+                    <button class="btn-tiny" id="swipeSelectAll">All</button>
+                    <button class="btn-tiny" id="swipeSelectNone">None</button>
+                </div>
+            </div>
+            <p class="field-hint" style="margin-bottom: 12px;">Pick which swipe file thumbnails to use as style references. Fewer = stronger identity match.</p>
+            <div class="swipe-picker-grid" id="swipePickerGrid">
+                <p style="color: var(--text-muted); font-size: 13px;">Loading...</p>
+            </div>
+        </div>
+
+        <!-- Generate Button -->
+        <div class="thumb-form-card">
             <button class="btn-generate" id="generateBtn">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
                 Generate Thumbnails
