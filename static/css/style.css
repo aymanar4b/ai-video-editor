@@ -519,16 +519,18 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    padding: 12px 16px;
+    gap: 6px;
+    padding: 12px 10px;
     background: none;
     border: none;
     color: var(--text-secondary);
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s;
     font-family: var(--font);
+    white-space: nowrap;
+    min-width: 0;
 }
 
 .toggle-btn.active {
@@ -724,8 +726,45 @@ body {
     aspect-ratio: 1;
     border-radius: var(--radius);
     overflow: hidden;
-    border: 1px solid var(--border);
+    border: 2px solid var(--teal);
+    cursor: pointer;
+    transition: all 0.15s;
 }
+.ref-photo-item.deselected {
+    border-color: var(--border);
+    opacity: 0.4;
+}
+.ref-photo-item .ref-check {
+    position: absolute;
+    bottom: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--teal);
+    color: #000;
+    font-size: 11px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.15s;
+}
+.ref-photo-item.deselected .ref-check { opacity: 0; }
+
+/* Tiny select all/none buttons */
+.ref-select-btns { display: flex; gap: 6px; }
+.btn-tiny {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.btn-tiny:hover { border-color: var(--teal); color: var(--teal); }
 .ref-photo-item img {
     width: 100%;
     height: 100%;
@@ -1140,6 +1179,125 @@ body {
     transition: opacity 0.2s;
 }
 .thumb-result-item:hover .thumb-download-btn { opacity: 1; }
+
+/* Favorite button */
+.thumb-fav-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: rgba(0,0,0,0.5);
+    border: none;
+    color: #aaa;
+    font-size: 18px;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    cursor: pointer;
+    opacity: 0;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+}
+.thumb-result-item:hover .thumb-fav-btn { opacity: 1; }
+.thumb-fav-btn.active { color: #ffd700; opacity: 1; }
+.thumb-fav-btn:hover { background: rgba(0,0,0,0.7); color: #ffd700; }
+
+/* Delete button */
+.thumb-delete-btn {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    background: rgba(0,0,0,0.5);
+    border: none;
+    color: #aaa;
+    font-size: 16px;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    cursor: pointer;
+    opacity: 0;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+}
+.thumb-result-item:hover .thumb-delete-btn { opacity: 1; }
+.thumb-delete-btn:hover { background: rgba(255,80,80,0.8); color: #fff; }
+
+/* Download ZIP button */
+.gen-zip-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 13px;
+    padding: 7px 18px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.gen-zip-btn:hover {
+    border-color: var(--text-secondary);
+    color: var(--text-primary);
+}
+
+/* View Favorites button */
+.fav-view-btn {
+    margin-left: auto;
+    background: none;
+    border: 1px solid #ffd700;
+    color: #ffd700;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 5px 14px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.fav-view-btn:hover { background: rgba(255,215,0,0.1); }
+.fav-view-btn.active { background: rgba(255,215,0,0.15); }
+
+/* Guest photo preview grid */
+.guest-preview-grid {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+.guest-preview-grid .guest-thumb {
+    position: relative;
+    width: 70px;
+    height: 70px;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    border: 1px solid var(--border);
+}
+.guest-preview-grid .guest-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.guest-preview-grid .guest-thumb .guest-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    border: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    font-size: 11px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+.guest-preview-grid .guest-thumb:hover .guest-remove { opacity: 1; }
 
 /* Source thumbnail — own row, centered */
 .gen-source-row {

@@ -193,6 +193,18 @@ def api_thumbnails():
     client_slug = request.form.get('client', '')
     mode = request.form.get('mode', 'replicate')
     swipe_files = request.form.get('swipe_files', '')
+    selected_refs = request.form.get('selected_refs', '')
+    skip_enhance = request.form.get('skip_enhance') == 'true'
+
+    # Handle guest photo uploads (collab mode)
+    guest_photo_paths = []
+    if mode == 'collab' and 'guest_photos' in request.files:
+        guest_files = request.files.getlist('guest_photos')
+        for gf in guest_files:
+            if gf.filename:
+                gp = TMP_DIR / f"guest_{gf.filename}"
+                gf.save(str(gp))
+                guest_photo_paths.append(str(gp))
 
     # Handle image uploads
     source_path = None
@@ -255,8 +267,14 @@ def api_thumbnails():
                 client_refs = CLIENTS_DIR / client_slug / "reference_photos"
                 if client_refs.exists():
                     cmd += ["--ref-dir", str(client_refs)]
+            if selected_refs:
+                cmd += ["--selected-refs", selected_refs]
             if swipe_files:
                 cmd += ["--swipe-files", swipe_files]
+            if skip_enhance:
+                cmd.append("--skip-enhance")
+            if guest_photo_paths:
+                cmd += ["--guest-photos", ",".join(guest_photo_paths)]
 
             num_vars = int(variations)
             log_lines = []
@@ -310,6 +328,10 @@ def api_thumbnails():
                     tasks[task_id]['progress'] = min(tasks[task_id]['progress'] + 10, 90)
                 elif 'Error: 429' in line or 'RESOURCE_EXHAUSTED' in line:
                     tasks[task_id]['status'] = 'API rate limited, retrying...'
+                elif 'FACE MISMATCH' in line:
+                    tasks[task_id]['status'] = 'Wrong face detected, regenerating...'
+                elif 'Face match score' in line:
+                    tasks[task_id]['status'] = 'Checking face identity...'
                 elif 'RETRY: Content filter blocked' in line:
                     tasks[task_id]['status'] = 'Content filter blocked, retrying with heavier anonymization...'
                 elif 'All anonymization levels exhausted' in line:
@@ -579,6 +601,124 @@ def api_thumbnail_history():
             groups.append(entry)
 
     return jsonify(groups)
+
+
+# ─── API: Prompt Enhancement ─────────────────────────────────────────────────
+
+@app.route('/api/enhance-prompt', methods=['POST'])
+def api_enhance_prompt():
+    """Enhance a user prompt using Gemini 2.5 Pro before generation."""
+    prompt = request.form.get('prompt', '')
+    youtube_url = request.form.get('youtube_url', '')
+    video_title = request.form.get('video_title', '')
+
+    if not prompt.strip():
+        return jsonify({'enhanced': ''})
+
+    try:
+        cmd = [PYTHON, "-u", "-c", f"""
+import sys, os, requests, io
+sys.path.insert(0, {repr(str(BASE_DIR))})
+os.chdir({repr(str(BASE_DIR))})
+from dotenv import load_dotenv
+load_dotenv()
+from PIL import Image
+from execution.recreate_thumbnails import enhance_prompt, get_youtube_thumbnail
+import re
+
+source = None
+url = {repr(youtube_url)}
+if url:
+    m = re.search(r'[?&]v=([A-Za-z0-9_-]{{11}})', url)
+    if m:
+        source = get_youtube_thumbnail(m.group(1))
+if source:
+    print(enhance_prompt(source, {repr(prompt)}, {repr(video_title)}))
+else:
+    print({repr(prompt)})
+"""]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        enhanced = result.stdout.strip()
+        if not enhanced:
+            enhanced = prompt
+        return jsonify({'enhanced': enhanced})
+    except Exception as e:
+        return jsonify({'enhanced': prompt, 'error': str(e)})
+
+
+# ─── API: Favorites ──────────────────────────────────────────────────────────
+
+FAVORITES_FILE = BASE_DIR / ".tmp" / "favorites.json"
+
+def _load_favorites():
+    if FAVORITES_FILE.exists():
+        return json.loads(FAVORITES_FILE.read_text())
+    return []
+
+def _save_favorites(favs):
+    FAVORITES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FAVORITES_FILE.write_text(json.dumps(favs))
+
+@app.route('/api/favorites')
+def api_get_favorites():
+    return jsonify(_load_favorites())
+
+@app.route('/api/favorites', methods=['POST'])
+def api_add_favorite():
+    path = request.json.get('path', '')
+    if not path:
+        return jsonify({'error': 'No path'}), 400
+    favs = _load_favorites()
+    if path not in favs:
+        favs.append(path)
+        _save_favorites(favs)
+    return jsonify({'favorites': favs})
+
+@app.route('/api/favorites', methods=['DELETE'])
+def api_remove_favorite():
+    path = request.json.get('path', '')
+    favs = _load_favorites()
+    if path in favs:
+        favs.remove(path)
+        _save_favorites(favs)
+    return jsonify({'favorites': favs})
+
+
+# ─── API: Delete Thumbnail ───────────────────────────────────────────────────
+
+@app.route('/api/thumbnails/<path:thumb_path>', methods=['DELETE'])
+def api_delete_thumbnail(thumb_path):
+    """Delete a single generated thumbnail."""
+    file_path = TMP_DIR / thumb_path
+    if file_path.exists():
+        file_path.unlink()
+        # Also remove from favorites if present
+        favs = _load_favorites()
+        if thumb_path in favs:
+            favs.remove(thumb_path)
+            _save_favorites(favs)
+        return jsonify({'deleted': thumb_path})
+    return jsonify({'error': 'Not found'}), 404
+
+
+# ─── API: Download ZIP ───────────────────────────────────────────────────────
+
+@app.route('/api/download-zip', methods=['POST'])
+def api_download_zip():
+    """Download multiple thumbnails as a ZIP file."""
+    import zipfile
+    import tempfile
+    paths = request.json.get('paths', [])
+    if not paths:
+        return jsonify({'error': 'No paths'}), 400
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+    with zipfile.ZipFile(tmp.name, 'w') as zf:
+        for p in paths:
+            full = TMP_DIR / p
+            if full.exists():
+                zf.write(full, full.name)
+    return send_file(tmp.name, as_attachment=True, download_name='thumbnails.zip')
 
 
 # ─── API: File Download ──────────────────────────────────────────────────────

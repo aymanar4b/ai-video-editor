@@ -263,6 +263,101 @@ def get_face_pose(image: Image.Image) -> tuple[float, float] | None:
         return (yaw, pitch)
 
 
+def get_face_ratios(image: Image.Image) -> list[float] | None:
+    """Extract normalized face geometry ratios from a PIL Image.
+
+    Returns a vector of distance ratios between key landmarks that are
+    relatively stable across poses/expressions and unique to each person
+    (eye spacing, nose-to-chin, face width, etc.).
+    """
+    img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    h, w = img.shape[:2]
+
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+        num_faces=1,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+    )
+
+    try:
+        with FaceLandmarker.create_from_options(options) as landmarker:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            result = landmarker.detect(mp_image)
+
+            if not result.face_landmarks:
+                return None
+
+            lm = result.face_landmarks[0]
+
+            def dist(a, b):
+                return math.sqrt((lm[a].x - lm[b].x)**2 + (lm[a].y - lm[b].y)**2)
+
+            # Key structural distances
+            eye_dist = dist(33, 263)        # left eye outer to right eye outer
+            nose_to_chin = dist(1, 152)     # nose tip to chin
+            face_width = dist(234, 454)     # left cheek to right cheek
+            nose_width = dist(48, 278)      # left nostril to right nostril
+            mouth_width = dist(61, 291)     # mouth corners
+            forehead_to_nose = dist(10, 1)  # forehead to nose tip
+            eye_to_mouth_l = dist(33, 61)   # left eye to left mouth
+            eye_to_mouth_r = dist(263, 291) # right eye to right mouth
+
+            # Normalize everything by eye distance (most stable reference)
+            if eye_dist < 0.001:
+                return None
+
+            ratios = [
+                nose_to_chin / eye_dist,
+                face_width / eye_dist,
+                nose_width / eye_dist,
+                mouth_width / eye_dist,
+                forehead_to_nose / eye_dist,
+                eye_to_mouth_l / eye_dist,
+                eye_to_mouth_r / eye_dist,
+            ]
+            return ratios
+    except Exception:
+        return None
+
+
+def face_similarity(ratios_a: list[float], ratios_b: list[float]) -> float:
+    """Compare two face ratio vectors. Returns 0-1 similarity (1 = identical)."""
+    if len(ratios_a) != len(ratios_b):
+        return 0.0
+    diffs = [abs(a - b) for a, b in zip(ratios_a, ratios_b)]
+    avg_diff = sum(diffs) / len(diffs)
+    # Map to 0-1: diff of 0 = 1.0, diff of 0.5+ = ~0
+    return max(0.0, 1.0 - avg_diff * 4)
+
+
+def check_face_match(generated: Image.Image, reference_photos: list[Image.Image],
+                     threshold: float = 0.15) -> bool:
+    """Check if the face in the generated thumbnail matches the reference photos.
+
+    Returns True if the face matches (or if we can't detect faces to compare).
+    Returns False only if we can confidently say the face is wrong.
+    """
+    gen_ratios = get_face_ratios(generated)
+    if gen_ratios is None:
+        return True  # Can't detect face in generated, skip check
+
+    ref_scores = []
+    for ref in reference_photos:
+        ref_ratios = get_face_ratios(ref)
+        if ref_ratios:
+            score = face_similarity(gen_ratios, ref_ratios)
+            ref_scores.append(score)
+
+    if not ref_scores:
+        return True  # Can't detect faces in refs, skip check
+
+    best_score = max(ref_scores)
+    print(f"  Face match score: {best_score:.2f} (threshold: {threshold})")
+    return best_score >= threshold
+
+
 def anonymize_source(image: Image.Image, level: int = 0) -> Image.Image:
     """Anonymize source thumbnail with escalating intensity.
 
@@ -442,12 +537,30 @@ def load_reference_photo(path: Path) -> Image.Image | None:
         return None
 
 
-def load_reference_photos(max_photos: int = 3, specific_path: Path | None = None) -> list[Image.Image]:
-    """Load reference photos for face consistency."""
+def load_reference_photos(max_photos: int = 3, specific_path: Path | None = None,
+                          only_files: list[str] | None = None) -> list[Image.Image]:
+    """Load reference photos for face consistency.
+
+    If only_files is provided, only load those specific filenames.
+    """
     photos = []
 
     if not REFERENCE_PHOTOS_DIR.exists():
         print(f"Warning: Reference photos not found at {REFERENCE_PHOTOS_DIR}")
+        return photos
+
+    extensions = {".jpg", ".jpeg", ".png", ".webp"}
+
+    if only_files is not None:
+        # Load only the selected files
+        for name in only_files:
+            f = REFERENCE_PHOTOS_DIR / name
+            if f.exists() and f.suffix.lower() in extensions:
+                ref = load_reference_photo(f)
+                if ref:
+                    photos.append(ref)
+                    if len(photos) >= max_photos:
+                        break
         return photos
 
     if specific_path and specific_path.exists():
@@ -457,7 +570,6 @@ def load_reference_photos(max_photos: int = 3, specific_path: Path | None = None
             if max_photos == 1:
                 return photos
 
-    extensions = {".jpg", ".jpeg", ".png", ".webp"}
     photo_files = sorted([
         f for f in REFERENCE_PHOTOS_DIR.iterdir()
         if f.suffix.lower() in extensions and f != specific_path
@@ -492,25 +604,22 @@ def enhance_prompt(source_image: Image.Image, user_prompt: str, video_title: str
 \"{user_prompt}\"
 {f'Video title: "{video_title}"' if video_title else ''}
 
-Your job: Rewrite the user's instructions into PRECISE, STRUCTURED directives for an image generation model. The image model is literal — it needs exact specifications.
+Your job: Rewrite ONLY what the user asked for into precise, structured directives for an image generation model. The image model is literal — it needs exact specifications.
 
-Rules:
-- Analyze the source thumbnail carefully first
-- Convert vague instructions into specific visual descriptions
-- Specify exact positions (top-left, center, bottom-right, etc.)
-- Specify exact colors, sizes (large/medium/small relative to frame), and styles
-- If the user says to replace something, describe BOTH what to remove AND what to put in its place
-- If the user mentions a count (e.g. "four videos"), be explicit about the grid layout (e.g. "2x2 grid")
-- Keep it concise — no explanations, just directives
+CRITICAL RULES:
+- ONLY include changes the user explicitly asked for. Do NOT invent, assume, or infer changes they didn't mention.
+- If the user said "add X", only add X. Do NOT also remove or change other things unless the user said to.
+- If the user's instructions are already clear and specific, just reformat them — don't embellish.
+- Specify positions (top-left, center, etc.), colors, and sizes where the user was vague.
+- Keep it concise — no explanations, no commentary, just directives.
+- Do NOT repeat sections. Output each section exactly ONCE.
 
 Output format — use ONLY these sections (skip any that don't apply):
 
-KEEP: [what stays the same from the source]
-REMOVE: [what to delete from the source]
-CHANGE: [what to modify and how]
-ADD: [new elements to include]
-TEXT: [exact text content, position, font style, color, size]
-LAYOUT: [spatial arrangement of elements]"""
+CHANGE: [what to modify and exactly how — only things the user mentioned]
+ADD: [new elements the user asked to include, with position/size/color]
+TEXT: [exact text content, position, font style, color — only if the user specified text changes]
+LAYOUT: [spatial arrangement — only if user mentioned layout changes]"""
     ]
 
     try:
@@ -523,6 +632,27 @@ LAYOUT: [spatial arrangement of elements]"""
             for part in response.candidates[0].content.parts:
                 if hasattr(part, 'text') and part.text:
                     enhanced = part.text.strip()
+                    # Remove duplicate sections (model sometimes repeats)
+                    lines = enhanced.split('\n')
+                    seen_sections = set()
+                    deduped = []
+                    for line in lines:
+                        stripped = line.strip()
+                        if stripped.endswith(':') and stripped[:-1] in ('CHANGE', 'ADD', 'TEXT', 'LAYOUT', 'KEEP', 'REMOVE'):
+                            if stripped in seen_sections:
+                                # Skip this section and everything until next section
+                                deduped.append(None)  # marker
+                                continue
+                            seen_sections.add(stripped)
+                        if deduped and deduped[-1] is None:
+                            if stripped.endswith(':') and stripped[:-1] in ('CHANGE', 'ADD', 'TEXT', 'LAYOUT', 'KEEP', 'REMOVE'):
+                                if stripped not in seen_sections:
+                                    deduped[-1] = line  # replace marker
+                                    seen_sections.add(stripped)
+                                continue
+                            continue
+                        deduped.append(line)
+                    enhanced = '\n'.join(l for l in deduped if l is not None)
                     print(f"Enhanced prompt:\n{enhanced}\n")
                     return enhanced
     except Exception as e:
@@ -746,6 +876,114 @@ OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail.
         return None
 
 
+def collab_thumbnail(
+    source_image: Image.Image,
+    reference_photos: list[Image.Image],
+    guest_photos: list[Image.Image],
+    additional_prompt: str = "",
+    video_title: str = "",
+    swipe_examples: list[Image.Image] | None = None,
+    anon_level: int = 0,
+) -> Image.Image | str | None:
+    """Recreate a thumbnail with the client AND a guest (two people).
+
+    Uses source thumbnail for layout, client reference photos for person 1,
+    and guest photos for person 2.
+    """
+    client = genai.Client(api_key=API_KEY)
+
+    thumb = source_image.copy()
+    thumb.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
+    thumb_anon = anonymize_source(thumb, level=anon_level)
+
+    contents = []
+
+    # Client reference photos
+    for i, ref in enumerate(reference_photos):
+        contents.append(f"PERSON A (client) — reference photo {i+1}. Use for Person A's face and appearance:")
+        contents.append(ref)
+
+    # Guest photos
+    for i, guest in enumerate(guest_photos):
+        contents.append(f"PERSON B (guest) — reference photo {i+1}. Use for Person B's face and appearance:")
+        contents.append(guest)
+
+    contents.append("Source thumbnail — THIS is the master layout. It features TWO people. Replace their faces using Person A and Person B references above:")
+    contents.append(thumb_anon)
+
+    if swipe_examples is None:
+        swipe_examples = load_swipe_examples()
+    if swipe_examples:
+        contents.append("STYLE REFERENCE — Match this level of quality:")
+        for ex in swipe_examples:
+            contents.append(ex)
+
+    title_section = ""
+    if video_title:
+        title_section = f'\nVIDEO TITLE: "{video_title}"'
+
+    user_overrides = ""
+    if additional_prompt:
+        user_overrides = f"""
+=== PRIORITY INSTRUCTIONS ===
+{additional_prompt}
+=== END PRIORITY INSTRUCTIONS ===
+"""
+
+    prompt = f"""You are an expert YouTube thumbnail designer. Recreate the source thumbnail above featuring TWO people.
+{user_overrides}
+
+TWO-PERSON RULES:
+- Person A (client) uses the PERSON A reference photos. Person B (guest) uses the PERSON B reference photos.
+- Both people must appear in the thumbnail. Match their positions from the source layout.
+- Each person's face must accurately match their respective reference photos: bone structure, jawline, nose, eyebrows, skin tone, hair.
+- Do NOT mix up the two people's faces. Person A's face comes ONLY from Person A refs. Person B's face comes ONLY from Person B refs.
+
+LAYOUT RULES (from source thumbnail):
+- Copy the source thumbnail's composition, background, text, props, and framing.
+- Keep both people in the same positions as the source.
+
+FRAMING:
+- Both people must be fully visible — no cropping of heads or faces.
+
+{PLAYBOOK}
+{title_section}
+
+OUTPUT: 1280x720 pixels, 16:9."""
+
+    contents.append(prompt)
+
+    print(f"Collab mode: generating with {len(reference_photos)} client refs + {len(guest_photos)} guest refs...")
+
+    try:
+        response = _api_call_with_timeout(client, MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
+
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    data = part.inline_data.data
+                    if data:
+                        img_bytes = base64.b64decode(data) if isinstance(data, str) else data
+                        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
+                elif hasattr(part, 'text') and part.text:
+                    print(f"Model note: {part.text[:200]}")
+        else:
+            feedback = getattr(response, 'prompt_feedback', None)
+            block_reason = getattr(feedback, 'block_reason', None) if feedback else None
+            if block_reason:
+                print(f"  BLOCKED (reason: {block_reason})")
+                return BLOCKED_SENTINEL
+            print(f"  No candidates. Prompt feedback: {feedback}")
+
+        print("No image in response")
+        return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
 def imagine_thumbnail(
     reference_photos: list[Image.Image],
     additional_prompt: str = "",
@@ -763,8 +1001,17 @@ def imagine_thumbnail(
     # Add swipe file examples as style references
     if swipe_examples is None:
         swipe_examples = load_swipe_examples()
-    if swipe_examples:
-        contents.append("STYLE REFERENCE — Real high-performing YouTube thumbnails (100k-3M+ views). Your output MUST match this level of quality, composition, and visual impact:")
+
+    has_swipe = swipe_examples and len(swipe_examples) > 0
+    if has_swipe:
+        contents.append("""STYLE REFERENCES — These are REAL high-performing YouTube thumbnails (100k-3M+ views).
+Your output MUST closely match the STYLE, AESTHETIC, and QUALITY of these examples:
+- Study the exact FONT STYLES used (modern, bold, clean sans-serif — NOT dated/decorative fonts)
+- Study the COLOR PALETTES (high contrast, cinematic tones)
+- Study the COMPOSITION (person placement, text placement, negative space)
+- Study the LIGHTING (cinematic, professional — NOT flat or stock-photo-like)
+- Study the OVERALL FEEL (premium, polished, 2024/2025 YouTube aesthetic)
+Your thumbnail MUST look like it belongs in the same collection as these:""")
         for ex in swipe_examples:
             contents.append(ex)
 
@@ -774,29 +1021,36 @@ def imagine_thumbnail(
 VIDEO TITLE: "{video_title}"
 TITLE-THUMBNAIL SYNERGY: This is CRITICAL. Title and thumbnail are a TEAM. The thumbnail adds an emotional/visual layer the title doesn't have. NEVER repeat the title. Use shorter, punchier overlay text (max 4 words) that pairs with the title. Example: if title is "I Made $50k in 30 Days", thumbnail text = "$50K" with shocked face — title provides context."""
 
+    user_direction = ""
     if additional_prompt:
-        prompt = f"""You are an elite YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a stunning, high-CTR YouTube thumbnail featuring the person from the reference photos.
-
-CREATIVE DIRECTION: {additional_prompt}
-"""
-    else:
-        prompt = """You are an elite YouTube thumbnail designer following the TikScale Thumbnail Design Playbook. Create a stunning, high-CTR YouTube thumbnail featuring the person from the reference photos.
-
-Use your creativity to design something that would make a viewer STOP scrolling and CLICK.
+        user_direction = f"""
+=== PRIORITY INSTRUCTIONS (these OVERRIDE any conflicting rules below) ===
+{additional_prompt}
+=== END PRIORITY INSTRUCTIONS ===
 """
 
-    prompt += f"""
-CRITICAL RULES:
-- ⚠️ #1 PRIORITY — IDENTITY: ONLY the person from the reference photos may appear. Do NOT invent, hallucinate, or substitute ANY other face. Every face in the output MUST be the reference person. Copy exact bone structure, jawline, nose, eyebrows, skin tone, hair. Before generating, look at the reference photos ONE MORE TIME.
-- ONE PERSON RULE: If the thumbnail has only one person visible, that person MUST be the reference person. No exceptions.
-- PROPORTION: Face must have NATURAL human proportions. No squeezing or stretching.
-- SKIN TONE: Must match across face and all visible body parts. Match scene lighting.
-- TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter. No repeated letters ("ASLEEP" not "ASLEEEP"), no missing letters.
+    prompt = f"""You are an elite YouTube thumbnail designer. Create a stunning, high-CTR YouTube thumbnail featuring the person from the reference photos.
+{user_direction}
+
+MODERN STYLE REQUIREMENTS (2024/2025 YouTube aesthetic):
+- FONTS: Use clean, bold, modern sans-serif fonts (like Montserrat, Inter, or similar). NEVER use dated, decorative, script, or clip-art-style fonts.
+- COLORS: High contrast. Rich, cinematic color grading. Popular palettes: dark backgrounds with bright accent colors, gradient overlays, or clean whites with bold color pops.
+- LIGHTING: Cinematic, dramatic lighting with depth. Rim lighting, color gels, or moody window light. NEVER flat, stock-photo lighting.
+- COMPOSITION: Clean and uncluttered. One clear focal point. Strategic use of negative space. Person takes up 40-60% of frame.
+- TEXT: Maximum 4 words. Large, bold, high contrast against background. Drop shadow or outline for readability. Positioned to not overlap the face.
+- OVERALL: Must look like a thumbnail from a top-tier creator (MrBeast, Ali Abdaal, MKBHD level quality). Premium, polished, professional.
+{'- MATCH THE STYLE of the provided style reference thumbnails EXACTLY.' if has_swipe else ''}
+
+IDENTITY RULES:
+- ONLY the person from the reference photos may appear. Copy exact bone structure, jawline, nose, eyebrows, skin tone, hair.
+- Face proportions must be NATURAL — no squeezing or stretching.
+- Skin tone consistent across face, neck, hands, arms.
+- TEXT ACCURACY: Spell EVERY word CORRECTLY.
 
 {PLAYBOOK}
 {title_section}
 
-OUTPUT: 1280x720 pixels, 16:9. Must look like a top-tier professional YouTube thumbnail that would get 100k+ views."""
+OUTPUT: 1280x720 pixels, 16:9. Must look like a top-tier professional YouTube thumbnail."""
 
     contents.append(prompt)
 
@@ -928,8 +1182,8 @@ def main():
     parser.add_argument("--edit", "-e", type=str,
                         help="Edit an existing thumbnail (path to image)")
     parser.add_argument("--mode", type=str, default="replicate",
-                        choices=["replicate", "mashup", "imagine"],
-                        help="Generation mode: replicate, mashup, or imagine")
+                        choices=["replicate", "mashup", "collab", "imagine"],
+                        help="Generation mode: replicate, mashup, collab, or imagine")
     parser.add_argument("--source2", type=str,
                         help="Second source thumbnail for mashup mode (URL or file path)")
     parser.add_argument("--youtube2", type=str,
@@ -953,6 +1207,12 @@ def main():
                         help="Override reference photos directory")
     parser.add_argument("--swipe-files", type=str, default="",
                         help="Comma-separated list of swipe example filenames to use (empty = all)")
+    parser.add_argument("--guest-photos", type=str, default="",
+                        help="Comma-separated paths to guest/second person photos (collab mode)")
+    parser.add_argument("--selected-refs", type=str, default="",
+                        help="Comma-separated filenames of selected reference photos (empty = all)")
+    parser.add_argument("--skip-enhance", action="store_true",
+                        help="Skip prompt enhancement (already done in frontend)")
 
     args = parser.parse_args()
 
@@ -1062,12 +1322,23 @@ def main():
             print(f"  - {path}")
         return output_paths
 
-    # === REPLICATE & MASHUP MODES (need source) ===
+    # === REPLICATE, MASHUP & COLLAB MODES (need source) ===
     source_image = load_source(args.youtube, args.source)
     if not source_image:
         print("Error: Provide --youtube URL or --source image")
         sys.exit(1)
     print(f"Source size: {source_image.size}")
+
+    # Load guest photos for collab mode
+    guest_photos = []
+    if args.mode == "collab" and args.guest_photos:
+        for gp in args.guest_photos.split(","):
+            gp = gp.strip()
+            if gp and Path(gp).exists():
+                guest = Image.open(gp)
+                guest.thumbnail(REF_SIZE, Image.Resampling.LANCZOS)
+                guest_photos.append(guest)
+        print(f"Loaded {len(guest_photos)} guest photos")
 
     # Load second source for mashup
     source_image_b = None
@@ -1094,18 +1365,27 @@ def main():
         else:
             print("No face detected in source, using default references")
 
+    # Filter to selected refs if specified
+    selected_ref_filter = None
+    if args.selected_refs:
+        selected_ref_filter = [f.strip() for f in args.selected_refs.split(',') if f.strip()]
+        print(f"Using {len(selected_ref_filter)} selected reference photos")
+
     reference_photos = load_reference_photos(
         max_photos=args.refs,
-        specific_path=best_reference
+        specific_path=best_reference,
+        only_files=selected_ref_filter,
     )
     if not reference_photos:
         print("Warning: No reference photos found. Results may vary.")
 
     # Enhance user prompt once (before all variations)
     enhanced_prompt = args.prompt
-    if args.prompt.strip():
+    if args.prompt.strip() and not args.skip_enhance:
         print("Enhancing prompt with AI...")
         enhanced_prompt = enhance_prompt(source_image, args.prompt, args.title)
+    elif args.skip_enhance:
+        print("Using pre-enhanced prompt from frontend")
 
     output_paths = []
 
@@ -1123,6 +1403,16 @@ def main():
                     additional_prompt=enhanced_prompt,
                     video_title=args.title,
                     swipe_examples=swipe_examples,
+                )
+            elif args.mode == "collab":
+                result = collab_thumbnail(
+                    source_image=source_image,
+                    reference_photos=reference_photos,
+                    guest_photos=guest_photos,
+                    additional_prompt=enhanced_prompt,
+                    video_title=args.title,
+                    swipe_examples=swipe_examples,
+                    anon_level=anon_level,
                 )
             else:
                 result = recreate_thumbnail(
@@ -1152,7 +1442,39 @@ def main():
             print(f"Failed to generate variation {i + 1}")
             continue
 
-        # Verify identity and spelling
+        # Face identity check — retry up to 2 times if face doesn't match
+        # Skip for collab mode (two different people would confuse the checker)
+        if reference_photos and args.mode != "collab":
+            max_face_retries = 2
+            for face_attempt in range(max_face_retries + 1):
+                if check_face_match(result, reference_photos):
+                    break
+                if face_attempt < max_face_retries:
+                    print(f"  FACE MISMATCH — regenerating (attempt {face_attempt + 2}/{max_face_retries + 1})")
+                    if args.mode == "mashup":
+                        result = mashup_thumbnail(
+                            source_a=source_image, source_b=source_image_b,
+                            reference_photos=reference_photos,
+                            additional_prompt=enhanced_prompt,
+                            video_title=args.title, swipe_examples=swipe_examples,
+                        )
+                    else:
+                        result = recreate_thumbnail(
+                            source_image=source_image, reference_photos=reference_photos,
+                            style_variation=args.style, additional_prompt=enhanced_prompt,
+                            video_title=args.title, swipe_examples=swipe_examples,
+                            anon_level=0,
+                        )
+                    if result is None or result == BLOCKED_SENTINEL:
+                        break
+                else:
+                    print(f"  Face still doesn't match after {max_face_retries + 1} attempts, keeping best result")
+
+        if result is None or result == BLOCKED_SENTINEL:
+            print(f"Failed to generate variation {i + 1}")
+            continue
+
+        # Verify spelling with the existing pass
         if reference_photos:
             print(f"  Running verify & fix pass...")
             result = verify_and_fix(result, reference_photos)

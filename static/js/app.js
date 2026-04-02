@@ -323,14 +323,17 @@ function addGenerationGroup(paths, label, meta) {
         </div>` : ''}
         <div class="generation-thumbs">
             ${paths.map((path, i) =>
-                `<div class="thumb-result-item" data-index="${startIdx + i}">
+                `<div class="thumb-result-item" data-index="${startIdx + i}" data-path="${path}">
                     <img src="/api/download/${path}" alt="Generated thumbnail">
+                    <button class="thumb-fav-btn" data-path="${path}" title="Favorite"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></button>
+                    <button class="thumb-delete-btn" data-path="${path}" title="Delete">&times;</button>
                     <a href="/api/download/${path}" download class="thumb-download-btn">Download</a>
                 </div>`
             ).join('')}
         </div>
         <div class="gen-regen-bar">
             <button class="gen-regen-btn">Regenerate</button>
+            <button class="gen-zip-btn" title="Download all as ZIP">Download All</button>
         </div>
     `;
 
@@ -348,6 +351,12 @@ function addGenerationGroup(paths, label, meta) {
     const regenBtn = group.querySelector('.gen-regen-btn');
     regenBtn.addEventListener('click', () => {
         if (meta) {
+            // Mode (replicate/mashup/imagine)
+            if (meta.mode) {
+                const modeIds = {replicate: 'modeReplicate', mashup: 'modeMashup', collab: 'modeCollab', imagine: 'modeImagine'};
+                const modeBtn = document.getElementById(modeIds[meta.mode]);
+                if (modeBtn) modeBtn.click();
+            }
             // Source URL
             if (meta.youtube_url) {
                 const urlEl = document.getElementById('youtubeUrl');
@@ -420,10 +429,117 @@ function addGenerationGroup(paths, label, meta) {
         });
     });
 
+    // Favorite buttons
+    group.querySelectorAll('.thumb-fav-btn').forEach(btn => {
+        const path = btn.dataset.path;
+        // Check if already favorited
+        if (window._favorites && window._favorites.has(path)) {
+            btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+            btn.classList.add('active');
+        }
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const isFav = btn.classList.contains('active');
+            const method = isFav ? 'DELETE' : 'POST';
+            const res = await fetch('/api/favorites', {
+                method, headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path}),
+            });
+            const data = await res.json();
+            window._favorites = new Set(data.favorites);
+            const starSvg = (filled) => `<svg width="14" height="14" viewBox="0 0 24 24" fill="${filled ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
+            btn.innerHTML = starSvg(!isFav);
+            btn.classList.toggle('active');
+            _updateFavButton();
+        });
+    });
+
+    // Delete buttons
+    group.querySelectorAll('.thumb-delete-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const path = btn.dataset.path;
+            const item = btn.closest('.thumb-result-item');
+            const res = await fetch(`/api/thumbnails/${path}`, {method: 'DELETE'});
+            if (res.ok) {
+                item.remove();
+                // Remove from _thumbPaths
+                const idx = window._thumbPaths.indexOf(path);
+                if (idx > -1) window._thumbPaths.splice(idx, 1);
+                // If no thumbs left in group, remove group
+                if (!group.querySelector('.generation-thumbs .thumb-result-item')) {
+                    group.remove();
+                }
+            }
+        });
+    });
+
+    // Download ZIP button
+    const zipBtn = group.querySelector('.gen-zip-btn');
+    if (zipBtn) {
+        zipBtn.addEventListener('click', async () => {
+            const res = await fetch('/api/download-zip', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({paths}),
+            });
+            if (res.ok) {
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'thumbnails.zip';
+                a.click();
+                URL.revokeObjectURL(url);
+            }
+        });
+    }
+
     return group;
 }
 
+function _updateFavButton() {
+    const btn = document.getElementById('viewFavoritesBtn');
+    if (btn) {
+        btn.classList.toggle('hidden', !window._favorites || window._favorites.size === 0);
+    }
+}
+
 async function loadThumbnailHistory() {
+    // Load favorites first so stars show correctly
+    try {
+        const favRes = await fetch('/api/favorites');
+        window._favorites = new Set(await favRes.json());
+        _updateFavButton();
+    } catch { window._favorites = new Set(); }
+
+    // View Favorites button
+    const viewFavBtn = document.getElementById('viewFavoritesBtn');
+    if (viewFavBtn) {
+        viewFavBtn.addEventListener('click', () => {
+            const grid = document.getElementById('previewGrid');
+            const isFiltered = viewFavBtn.classList.contains('active');
+            viewFavBtn.classList.toggle('active');
+
+            if (!isFiltered) {
+                // Show only favorites
+                viewFavBtn.textContent = 'Show All';
+                grid.querySelectorAll('.generation-group').forEach(g => g.classList.add('hidden'));
+                grid.querySelectorAll('.thumb-result-item[data-path]').forEach(item => {
+                    if (window._favorites.has(item.dataset.path)) {
+                        item.closest('.generation-group').classList.remove('hidden');
+                        item.style.display = '';
+                    }
+                });
+            } else {
+                // Show all
+                viewFavBtn.textContent = 'Favorites';
+                grid.querySelectorAll('.generation-group').forEach(g => g.classList.remove('hidden'));
+                grid.querySelectorAll('.thumb-result-item').forEach(item => item.style.display = '');
+            }
+        });
+    }
+
     try {
         const res = await fetch('/api/thumbnails/history');
         const groups = await res.json();
@@ -522,25 +638,70 @@ function initThumbnails() {
         const res = await fetch(`/api/clients/${slug}/references`);
         const photos = await res.json();
         refPhotosGrid.innerHTML = '';
+        window._selectedRefs = new Set();
+
+        const selectBtns = document.getElementById('refSelectBtns');
+
         if (photos.length === 0) {
             refPhotosGrid.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">No reference photos yet</p>';
+            if (selectBtns) selectBtns.style.display = 'none';
             return;
         }
+
+        if (selectBtns) selectBtns.style.display = 'flex';
+
+        // All selected by default
+        photos.forEach(p => window._selectedRefs.add(p.name));
+
         photos.forEach(photo => {
             const item = document.createElement('div');
             item.className = 'ref-photo-item';
+            item.dataset.name = photo.name;
             item.innerHTML = `
                 <img src="${photo.url}" alt="${photo.name}">
+                <div class="ref-check">\u2713</div>
                 <button class="ref-delete-btn" data-name="${photo.name}" title="Remove">&times;</button>
             `;
+            // Toggle selection on click
+            item.addEventListener('click', () => {
+                const name = item.dataset.name;
+                if (item.classList.contains('deselected')) {
+                    item.classList.remove('deselected');
+                    window._selectedRefs.add(name);
+                } else {
+                    item.classList.add('deselected');
+                    window._selectedRefs.delete(name);
+                }
+            });
             item.querySelector('.ref-delete-btn').addEventListener('click', async (e) => {
                 e.stopPropagation();
                 const name = e.target.dataset.name;
                 await fetch(`/api/clients/${slug}/references/${name}`, { method: 'DELETE' });
+                window._selectedRefs.delete(name);
                 loadReferences(slug);
             });
             refPhotosGrid.appendChild(item);
         });
+
+        // All / None buttons
+        const allBtn = document.getElementById('refSelectAll');
+        const noneBtn = document.getElementById('refSelectNone');
+        if (allBtn) {
+            allBtn.onclick = () => {
+                refPhotosGrid.querySelectorAll('.ref-photo-item').forEach(item => {
+                    item.classList.remove('deselected');
+                    window._selectedRefs.add(item.dataset.name);
+                });
+            };
+        }
+        if (noneBtn) {
+            noneBtn.onclick = () => {
+                refPhotosGrid.querySelectorAll('.ref-photo-item').forEach(item => {
+                    item.classList.add('deselected');
+                    window._selectedRefs.delete(item.dataset.name);
+                });
+            };
+        }
     }
 
     // Reference photo upload
@@ -573,6 +734,7 @@ function initThumbnails() {
     const modeButtons = [
         document.getElementById('modeReplicate'),
         document.getElementById('modeMashup'),
+        document.getElementById('modeCollab'),
         document.getElementById('modeImagine'),
     ];
     const modeDesc = document.getElementById('modeDescription');
@@ -580,17 +742,20 @@ function initThumbnails() {
     const sourceBSection = document.getElementById('sourceBSection');
     const sourceALabel = document.getElementById('sourceALabel');
     const skipMatchOption = document.getElementById('skipMatchOption');
+    const guestSection = document.getElementById('guestSection');
     const thumbPrompt = document.getElementById('thumbPrompt');
 
     const modeDescriptions = {
         replicate: 'Recreate an existing thumbnail with your face swapped in.',
         mashup: 'Merge two thumbnails together — takes the best elements from both.',
+        collab: 'Recreate a thumbnail featuring the client + a guest (two people).',
         imagine: 'AI creates a thumbnail from scratch using the playbook. Add instructions or leave blank for full creativity.',
     };
     const modePlaceholders = {
         replicate: "e.g. 'Make expression confident and serious' or 'Boost contrast, make text pop more'",
-        mashup: "e.g. 'Use the composition from A and the color scheme from B' or 'Combine the text style of A with the background of B'",
-        imagine: "e.g. 'Results-forward style with $50k revenue number' or 'Counterintuitive statement: Stop Using Calendly' — leave blank for full AI creativity",
+        mashup: "e.g. 'Use the composition from A and the color scheme from B'",
+        collab: "e.g. 'Client on the left, guest on the right' or 'Podcast interview style'",
+        imagine: "e.g. 'Results-forward style with $50k revenue number' — leave blank for full AI creativity",
     };
 
     modeButtons.forEach(btn => {
@@ -620,8 +785,50 @@ function initThumbnails() {
                 sourceBSection.classList.add('hidden');
                 sourceALabel.textContent = 'SOURCE THUMBNAIL';
             }
+
+            // Show/hide guest section for collab
+            if (window._thumbMode === 'collab') {
+                guestSection.classList.remove('hidden');
+            } else {
+                guestSection.classList.add('hidden');
+            }
         });
     });
+
+    // ─── Guest Photos Upload (collab mode) ───────────────────────────
+    const guestUploadZone = document.getElementById('guestUploadZone');
+    const guestFiles = document.getElementById('guestFiles');
+    const guestPreviewGrid = document.getElementById('guestPreviewGrid');
+    window._guestFiles = [];
+
+    if (guestUploadZone) {
+        guestUploadZone.addEventListener('click', () => guestFiles.click());
+        guestUploadZone.addEventListener('dragover', (e) => { e.preventDefault(); guestUploadZone.classList.add('drag-over'); });
+        guestUploadZone.addEventListener('dragleave', () => guestUploadZone.classList.remove('drag-over'));
+        guestUploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            guestUploadZone.classList.remove('drag-over');
+            _addGuestFiles(e.dataTransfer.files);
+        });
+        guestFiles.addEventListener('change', () => _addGuestFiles(guestFiles.files));
+    }
+
+    function _addGuestFiles(files) {
+        for (const f of files) {
+            if (!f.type.startsWith('image/')) continue;
+            window._guestFiles.push(f);
+            const url = URL.createObjectURL(f);
+            const idx = window._guestFiles.length - 1;
+            const thumb = document.createElement('div');
+            thumb.className = 'guest-thumb';
+            thumb.innerHTML = `<img src="${url}"><button class="guest-remove" data-idx="${idx}">&times;</button>`;
+            thumb.querySelector('.guest-remove').addEventListener('click', () => {
+                window._guestFiles[idx] = null;
+                thumb.remove();
+            });
+            guestPreviewGrid.appendChild(thumb);
+        }
+    }
 
     // ─── Source Toggle (A) ────────────────────────────────────────────
     btnYoutube.addEventListener('click', () => {
@@ -653,8 +860,11 @@ function initThumbnails() {
     const urlInput = document.getElementById('youtubeUrl');
     const thumbPreview = document.getElementById('thumbPreview');
     const thumbPreviewImg = document.getElementById('thumbPreviewImg');
-    urlInput.addEventListener('input', () => showThumbPreview(urlInput, thumbPreview, thumbPreviewImg));
-    urlInput.addEventListener('paste', () => setTimeout(() => showThumbPreview(urlInput, thumbPreview, thumbPreviewImg), 0));
+    const triggerPreview1 = () => showThumbPreview(urlInput, thumbPreview, thumbPreviewImg);
+    urlInput.addEventListener('input', triggerPreview1);
+    urlInput.addEventListener('paste', () => setTimeout(triggerPreview1, 50));
+    urlInput.addEventListener('change', triggerPreview1);
+    urlInput.addEventListener('keyup', triggerPreview1);
 
     btnUpload.addEventListener('click', () => {
         btnUpload.classList.add('active');
@@ -702,8 +912,11 @@ function initThumbnails() {
     const thumbPreview2 = document.getElementById('thumbPreview2');
     const thumbPreviewImg2 = document.getElementById('thumbPreviewImg2');
     if (urlInput2 && thumbPreview2) {
-        urlInput2.addEventListener('input', () => showThumbPreview(urlInput2, thumbPreview2, thumbPreviewImg2));
-        urlInput2.addEventListener('paste', () => setTimeout(() => showThumbPreview(urlInput2, thumbPreview2, thumbPreviewImg2), 0));
+        const triggerPreview2 = () => showThumbPreview(urlInput2, thumbPreview2, thumbPreviewImg2);
+        urlInput2.addEventListener('input', triggerPreview2);
+        urlInput2.addEventListener('paste', () => setTimeout(triggerPreview2, 50));
+        urlInput2.addEventListener('change', triggerPreview2);
+        urlInput2.addEventListener('keyup', triggerPreview2);
     }
 
     if (thumbUploadZone2) {
@@ -807,42 +1020,28 @@ async function loadSwipePicker() {
     }
 }
 
-async function generateThumbnails() {
-    const overlay = document.getElementById('thumbProgressOverlay');
-    const bar = document.getElementById('thumbProgressBar');
-    const status = document.getElementById('thumbProgressStatus');
-
-    overlay.classList.remove('hidden');
-    bar.style.width = '10%';
-    status.textContent = 'Starting generation...';
-
+function _buildFormData() {
     const formData = new FormData();
     const mode = window._thumbMode || 'replicate';
     formData.append('mode', mode);
 
-    // Source A (not needed for imagine mode)
     if (mode !== 'imagine') {
         const btnYoutube = document.getElementById('btnYoutube');
         if (btnYoutube.classList.contains('active')) {
             formData.append('youtube_url', document.getElementById('youtubeUrl').value);
         } else {
             const thumbFile = document.getElementById('thumbFile');
-            if (thumbFile.files.length) {
-                formData.append('image', thumbFile.files[0]);
-            }
+            if (thumbFile.files.length) formData.append('image', thumbFile.files[0]);
         }
     }
 
-    // Source B (mashup only)
     if (mode === 'mashup') {
         const btnYoutube2 = document.getElementById('btnYoutube2');
         if (btnYoutube2.classList.contains('active')) {
             formData.append('youtube_url2', document.getElementById('youtubeUrl2').value);
         } else {
             const thumbFile2 = document.getElementById('thumbFile2');
-            if (thumbFile2.files.length) {
-                formData.append('image2', thumbFile2.files[0]);
-            }
+            if (thumbFile2.files.length) formData.append('image2', thumbFile2.files[0]);
         }
     }
 
@@ -851,19 +1050,37 @@ async function generateThumbnails() {
     formData.append('skip_match', document.getElementById('skipMatch').checked);
     formData.append('prompt', document.getElementById('thumbPrompt').value);
     formData.append('video_title', document.getElementById('videoTitle').value);
-
-    // Send selected swipe examples (always send — empty string means "none")
     if (window._swipeSelections) {
         formData.append('swipe_files', Array.from(window._swipeSelections).join(','));
     }
     formData.append('client', document.getElementById('clientSelect').value);
 
-    try {
-        const response = await fetch('/api/thumbnails', {
-            method: 'POST',
-            body: formData,
-        });
+    // Selected reference photos (if any are deselected)
+    if (window._selectedRefs && window._selectedRefs.size > 0) {
+        formData.append('selected_refs', Array.from(window._selectedRefs).join(','));
+    }
 
+    // Guest photos for collab mode
+    if (mode === 'collab' && window._guestFiles) {
+        window._guestFiles.forEach((f, i) => {
+            if (f) formData.append('guest_photos', f);
+        });
+    }
+
+    return formData;
+}
+
+async function _submitGeneration(formData) {
+    const overlay = document.getElementById('thumbProgressOverlay');
+    const bar = document.getElementById('thumbProgressBar');
+    const status = document.getElementById('thumbProgressStatus');
+
+    overlay.classList.remove('hidden');
+    bar.style.width = '10%';
+    status.textContent = 'Starting generation...';
+
+    try {
+        const response = await fetch('/api/thumbnails', { method: 'POST', body: formData });
         const data = await response.json();
         if (!response.ok || data.error) {
             overlay.classList.add('hidden');
@@ -875,6 +1092,75 @@ async function generateThumbnails() {
         overlay.classList.add('hidden');
         showToast(err.message, 'error');
     }
+}
+
+async function generateThumbnails() {
+    const formData = _buildFormData();
+    const prompt = document.getElementById('thumbPrompt').value.trim();
+
+    // If there's a prompt, offer to enhance it first
+    if (prompt) {
+        const previewOverlay = document.getElementById('promptPreviewOverlay');
+        const enhancedText = document.getElementById('enhancedPromptText');
+        const progressOverlay = document.getElementById('thumbProgressOverlay');
+        const bar = document.getElementById('thumbProgressBar');
+        const status = document.getElementById('thumbProgressStatus');
+
+        // Show progress while enhancing
+        progressOverlay.classList.remove('hidden');
+        bar.style.width = '5%';
+        status.textContent = 'Enhancing prompt with AI...';
+
+        try {
+            const enhanceData = new FormData();
+            enhanceData.append('prompt', prompt);
+            enhanceData.append('youtube_url', document.getElementById('youtubeUrl')?.value || '');
+            enhanceData.append('video_title', document.getElementById('videoTitle')?.value || '');
+
+            const res = await fetch('/api/enhance-prompt', { method: 'POST', body: enhanceData });
+            const data = await res.json();
+
+            progressOverlay.classList.add('hidden');
+
+            if (data.enhanced && data.enhanced !== prompt) {
+                // Show preview modal
+                enhancedText.value = data.enhanced;
+                previewOverlay.classList.remove('hidden');
+
+                // Wait for user choice
+                await new Promise((resolve) => {
+                    const approve = document.getElementById('approveEnhancedBtn');
+                    const skip = document.getElementById('skipEnhancedBtn');
+
+                    const cleanup = () => {
+                        previewOverlay.classList.add('hidden');
+                        approve.removeEventListener('click', onApprove);
+                        skip.removeEventListener('click', onSkip);
+                    };
+                    const onApprove = () => {
+                        // Use the (possibly edited) enhanced prompt — skip backend enhancement
+                        formData.set('prompt', enhancedText.value);
+                        formData.set('skip_enhance', 'true');
+                        cleanup();
+                        resolve();
+                    };
+                    const onSkip = () => {
+                        // Keep original prompt — skip backend enhancement
+                        formData.set('skip_enhance', 'true');
+                        cleanup();
+                        resolve();
+                    };
+                    approve.addEventListener('click', onApprove);
+                    skip.addEventListener('click', onSkip);
+                });
+            }
+        } catch (err) {
+            progressOverlay.classList.add('hidden');
+            // Enhancement failed, proceed with original
+        }
+    }
+
+    _submitGeneration(formData);
 }
 
 async function pollThumbnailProgress(taskId) {
