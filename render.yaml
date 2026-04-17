@@ -1,0 +1,38 @@
+# Render infrastructure-as-code for TikScale Thumbnail Generator.
+# Usage: on Render, click "New +" → "Blueprint" → connect this repo.
+# Render auto-detects this file and provisions the web service + disk.
+#
+# See DEPLOY.md for the full click-by-click setup.
+
+services:
+  - type: web
+    name: tikscale-thumbnails
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter  # $7/mo, 512 MB RAM — bump to "standard" ($25/mo, 2 GB) if generations OOM
+    region: oregon
+    branch: main
+    healthCheckPath: /health
+    autoDeploy: true  # every push to main redeploys automatically
+
+    # Persistent disk for .tmp/clients/, .tmp/thumbnails/, .tmp/*.png
+    disk:
+      name: tikscale-data
+      mountPath: /app/.tmp
+      sizeGB: 10  # $2.50/mo at $0.25/GB. 10 GB = thousands of thumbnails.
+
+    envVars:
+      # Secrets — set these values in the Render dashboard, NOT here.
+      - key: NANO_BANANA_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      # Optional overrides
+      - key: APP_USERNAME
+        value: tikscale
+      - key: THUMB_CONCURRENCY
+        value: "2"  # cap concurrent generations to 2 on the starter plan
+      - key: PYTHONUNBUFFERED
+        value: "1"  # stream logs to Render's log viewer in real time

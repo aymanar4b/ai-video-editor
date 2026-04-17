@@ -15,7 +15,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify, send_file
+from functools import wraps
+
+from flask import Flask, render_template, request, jsonify, send_file, Response
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -40,6 +42,61 @@ tasks = {}
 # integer (e.g. 2) if you start hitting Gemini 429s or local resource limits.
 THUMB_CONCURRENCY = int(os.getenv('THUMB_CONCURRENCY', '999'))
 thumb_sem = threading.Semaphore(THUMB_CONCURRENCY)
+
+
+# ─── Basic HTTP Auth ──────────────────────────────────────────────────────────
+# Enabled only when APP_PASSWORD env var is set (i.e. in production / Render).
+# Locally you can leave APP_PASSWORD unset and skip auth entirely. Username is
+# fixed to "tikscale"; password comes from the env var. One shared credential.
+
+APP_PASSWORD = os.getenv('APP_PASSWORD', '').strip()
+APP_USERNAME = os.getenv('APP_USERNAME', 'tikscale').strip()
+
+
+def _check_auth(username: str, password: str) -> bool:
+    return (username == APP_USERNAME and password == APP_PASSWORD)
+
+
+def _auth_required_response():
+    return Response(
+        'Authentication required.\n', 401,
+        {'WWW-Authenticate': 'Basic realm="TikScale Thumbnail Generator"'},
+    )
+
+
+def _require_auth(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        # If no password is configured (e.g. local dev), skip auth.
+        if not APP_PASSWORD:
+            return view(*args, **kwargs)
+        auth = request.authorization
+        if not auth or not _check_auth(auth.username or '', auth.password or ''):
+            return _auth_required_response()
+        return view(*args, **kwargs)
+    return wrapped
+
+
+@app.before_request
+def _global_auth_check():
+    """Gate every request behind basic auth when APP_PASSWORD is set.
+
+    Leaves /health open so Render's uptime checks don't fail.
+    """
+    if not APP_PASSWORD:
+        return None
+    if request.path == '/health' or request.path.startswith('/static/'):
+        return None
+    auth = request.authorization
+    if not auth or not _check_auth(auth.username or '', auth.password or ''):
+        return _auth_required_response()
+    return None
+
+
+@app.route('/health')
+def health():
+    """Render uptime check endpoint — unauthenticated on purpose."""
+    return {'ok': True}, 200
 
 
 def _extract_error_from_log(full_log: str, returncode: int, default: str = "Generation failed.") -> str:

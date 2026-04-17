@@ -1,0 +1,42 @@
+# Local state and caches — never ship these to the build context
+.tmp/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
+
+# Local env / secrets — Render injects these
+.env
+
+# Editor / OS junk
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# Logs
+*.log
+nohup.out
+server.log
+thumb_debug.log
+
+# ML model — downloaded in the Dockerfile at build time
+models/
+
+# Media files (won't be built from)
+*.mp4
+*.wav
+*.aac
+
+# Large PDFs (optional — remove if you want them in the image)
+Thumbnail-swipe-file.pdf
+TikScale Thumbnail Design Playbook.pdf
+
+# Docker / git metadata
+.git/
+.gitignore
+.github/
+
+# Nick's reference files
+nick files/
