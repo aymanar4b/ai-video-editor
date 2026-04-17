@@ -72,6 +72,28 @@
                 </button>
             </div>
             <p class="mode-description" id="modeDescription">Recreate an existing thumbnail with your face swapped in.</p>
+
+            <label class="field-label coral" style="margin-top: 16px;">IMAGE MODEL</label>
+            <div class="toggle-group">
+                <button class="toggle-btn active" data-provider="gemini" id="btnProviderGemini">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2v20M2 12h20"/></svg>
+                    Gemini 3 Pro
+                </button>
+                <button class="toggle-btn" data-provider="openai" id="btnProviderOpenAI">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                    GPT Image 1.5
+                </button>
+            </div>
+            <p class="mode-description" id="providerDescription">Gemini 3 Pro Image — current default. Switch to GPT Image 1.5 for A/B testing replicate &amp; imagine modes.</p>
+
+            <div id="openaiQualitySection" class="hidden" style="margin-top: 12px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label class="field-label" style="margin: 0; white-space: nowrap;">QUALITY</label>
+                    <input type="range" id="openaiQuality" min="0" max="2" value="2" step="1" class="slider" style="flex: 1;">
+                    <span id="openaiQualityLabel" class="slider-value" style="min-width: 60px; text-align: right;">HIGH</span>
+                </div>
+                <p class="field-hint" id="openaiQualityCost" style="margin-top: 4px;">~$0.35-0.40/image — best output quality</p>
+            </div>
         </div>
 
         <!-- Source Material -->
@@ -90,6 +112,10 @@
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                         Upload Image
                     </button>
+                    <button class="toggle-btn" data-mode="swipe" id="btnSwipeSource">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                        Swipe File
+                    </button>
                 </div>
 
                 <div id="youtubeInput">
@@ -106,6 +132,13 @@
                     <div class="thumb-upload-zone" id="thumbUploadZone">
                         <input type="file" id="thumbFile" accept=".jpg,.jpeg,.png,.webp" hidden>
                         <p>Drop image or <span class="coral-text">browse</span></p>
+                    </div>
+                </div>
+
+                <div id="swipeSourceInput" class="hidden">
+                    <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 8px;">Pick a thumbnail from your swipe file to use as the layout template</p>
+                    <div class="swipe-source-grid" id="swipeSourceGrid">
+                        <p style="color: var(--text-muted); font-size: 12px;">Loading swipe files...</p>
                     </div>
                 </div>
             </div>
@@ -189,6 +222,14 @@
             <label class="field-label" style="margin-top: 12px;">ADDITIONAL INSTRUCTIONS</label>
             <textarea id="thumbPrompt" class="text-area" rows="4" placeholder="Be specific about what to change from the source. e.g:&#10;• Text should say 'BEST' then YouTube logo then 'FORMATS'&#10;• Replace vertical images with 4 blurred 16:9 YouTube videos&#10;• YouTube logo must be red, text white bold"></textarea>
             <p class="field-hint">These override the source layout. Be specific: describe exact text, colors, counts, and sizes. Vague prompts get vague results.</p>
+
+            <label class="option-item compact" style="margin-top: 8px;">
+                <div class="option-checkbox">
+                    <input type="checkbox" id="enhancePromptToggle">
+                    <span class="checkmark"></span>
+                </div>
+                <span class="option-label">AI-enhance prompt before generating</span>
+            </label>
         </div>
 
         <!-- Swipe File Inspiration Picker -->
@@ -201,8 +242,34 @@
                 </div>
             </div>
             <p class="field-hint" style="margin-bottom: 12px;">Pick which swipe file thumbnails to use as style references. Fewer = stronger identity match.</p>
+
+            <!-- Tabs: switch between universal swipes and the selected client's swipes -->
+            <div class="swipe-tabs">
+                <button type="button" class="swipe-tab active" data-swipe-tab="universal">Universal</button>
+                <button type="button" class="swipe-tab" data-swipe-tab="client" id="swipeTabClient" disabled>Client</button>
+                <span class="swipe-selected-count" id="swipeSelectedCount"></span>
+            </div>
+
+            <!-- Universal pool (default) -->
             <div class="swipe-picker-grid" id="swipePickerGrid">
                 <p style="color: var(--text-muted); font-size: 13px;">Loading...</p>
+            </div>
+
+            <!-- Client pool (hidden until client tab is active) -->
+            <div id="swipeClientPanel" class="hidden">
+                <div style="display: flex; gap: 8px; margin-bottom: 10px; align-items: stretch;">
+                    <div id="swipeClientUploadZone" class="edit-logos-drop-zone" style="margin-bottom: 0; flex: 1;">
+                        <p style="margin: 0; color: var(--text-muted); font-size: 12px;">Drop client thumbnails to add — they'll appear in the grid below</p>
+                        <input type="file" id="swipeClientFileInput" accept="image/*" multiple hidden>
+                    </div>
+                    <button type="button" class="btn-yt-import" id="btnImportYouTube" title="Import thumbnails from YouTube channel">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.2c-.3-1-1-1.8-2-2.1C19.6 3.5 12 3.5 12 3.5s-7.6 0-9.5.6c-1 .3-1.7 1.1-2 2.1C0 8.1 0 12 0 12s0 3.9.5 5.8c.3 1 1 1.8 2 2.1 1.9.6 9.5.6 9.5.6s7.6 0 9.5-.6c1-.3 1.7-1.1 2-2.1.5-1.9.5-5.8.5-5.8s0-3.9-.5-5.8zM9.5 15.6V8.4l6.3 3.6-6.3 3.6z"/></svg>
+                        Import from YT
+                    </button>
+                </div>
+                <div class="swipe-picker-grid" id="swipeClientGrid">
+                    <p style="color: var(--text-muted); font-size: 13px;">Select a client to manage their swipes.</p>
+                </div>
             </div>
         </div>
 
@@ -261,14 +328,94 @@
     </div>
 </div>
 
-<!-- Progress overlay -->
-<div class="progress-overlay hidden" id="thumbProgressOverlay">
-    <div class="progress-card">
-        <h3>Generating thumbnails...</h3>
-        <div class="progress-bar-container">
-            <div class="progress-bar" id="thumbProgressBar"></div>
+<!-- Edit Thumbnail Modal -->
+<div class="progress-overlay hidden" id="editThumbnailOverlay">
+    <div class="progress-card edit-thumb-card">
+        <h3 style="text-align: center; margin-bottom: 16px;">Edit Thumbnail</h3>
+        <div class="edit-thumb-preview-wrap">
+            <img id="editThumbnailImg" alt="Thumbnail to edit">
         </div>
-        <p class="progress-status" id="thumbProgressStatus">Initializing...</p>
+        <p style="font-size: 12px; color: var(--text-muted); margin: 12px 0 6px;">Describe what to change. Be specific — e.g. "Replace the icons in the S tier with Stripe and Shopify, keep everything else the same."</p>
+        <textarea id="editThumbnailPrompt" class="text-area" rows="6" placeholder="What should change?" style="margin-bottom: 12px; font-size: 13px;"></textarea>
+
+        <!-- Style reference: a full-frame image to emulate look/layout/composition -->
+        <div class="edit-styleref-section">
+            <div class="edit-logos-header">
+                <label style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px;">Style reference (optional)</label>
+                <span style="font-size: 11px; color: var(--text-muted);">Match this look</span>
+            </div>
+            <div id="editStyleRefDropZone" class="edit-logos-drop-zone">
+                <p style="margin: 0; color: var(--text-muted); font-size: 12px;">Drop a thumbnail to use as a style/layout guide</p>
+                <input type="file" id="editStyleRefFileInput" accept="image/*" hidden>
+            </div>
+            <div id="editStyleRefPreview" class="edit-styleref-preview hidden">
+                <img id="editStyleRefPreviewImg" alt="Style reference">
+                <button type="button" id="editStyleRefRemoveBtn" class="edit-styleref-remove-btn" title="Remove">&times;</button>
+            </div>
+        </div>
+
+        <!-- Reference logos: use exact images instead of hoping Gemini hallucinates the right one -->
+        <div class="edit-logos-section">
+            <div class="edit-logos-header">
+                <label style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px;">Reference logos (optional)</label>
+                <span style="font-size: 11px; color: var(--text-muted);">Paste URL or drop image files</span>
+            </div>
+            <div class="edit-logos-url-row">
+                <input type="text" id="editLogoUrl" class="text-input" placeholder="https://example.com/logo.png" style="flex: 1;">
+                <button type="button" class="gen-regen-btn" id="editLogoAddUrlBtn" style="padding: 8px 14px; white-space: nowrap;">Preview &amp; Add</button>
+            </div>
+            <div id="editLogoUrlError" class="edit-logos-error hidden"></div>
+            <div id="editLogoUrlPreview" class="edit-logos-url-preview hidden">
+                <img id="editLogoUrlPreviewImg" alt="URL preview">
+                <div class="edit-logos-url-preview-actions">
+                    <span id="editLogoUrlPreviewLabel" class="edit-logos-url-preview-label">Does this look right?</span>
+                    <button type="button" class="gen-regen-btn" id="editLogoUrlConfirmBtn" style="padding: 6px 12px; font-size: 12px;">Add to list</button>
+                    <button type="button" id="editLogoUrlRejectBtn" class="edit-logos-reject-btn">Cancel</button>
+                </div>
+            </div>
+            <div id="editLogoDropZone" class="edit-logos-drop-zone">
+                <p style="margin: 0; color: var(--text-muted); font-size: 12px;">…or drop image files here</p>
+                <input type="file" id="editLogoFileInput" accept="image/*" multiple hidden>
+            </div>
+            <div id="editLogoChips" class="edit-logos-chips"></div>
+        </div>
+
+        <div class="edit-variations-row">
+            <label for="editVariations" style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px;">Variations</label>
+            <input type="range" id="editVariations" min="1" max="5" value="1" step="1" class="slider">
+            <span id="editVariationsValue" class="slider-value">01</span>
+        </div>
+        <div style="display: flex; gap: 10px; justify-content: center; margin-top: 16px;">
+            <button class="gen-regen-btn" id="submitEditBtn" style="flex: 1; padding: 12px;">Apply Edit</button>
+            <button class="btn-generate" id="cancelEditBtn" style="flex: 1;">Cancel</button>
+        </div>
     </div>
 </div>
+
+<!-- YouTube Import Modal -->
+<div class="yt-import-overlay hidden" id="ytImportOverlay">
+    <div class="yt-import-modal">
+        <div class="yt-import-header">
+            <h3 style="margin: 0; font-size: 16px;">Import from YouTube</h3>
+            <button class="yt-import-close" id="ytImportClose">&times;</button>
+        </div>
+        <div class="yt-import-body">
+            <div class="yt-import-url-row">
+                <input type="text" id="ytChannelUrl" class="custom-select" placeholder="Paste YouTube channel URL (e.g. youtube.com/@MrBeast)" style="flex: 1;">
+                <button class="btn-tiny" id="ytFetchBtn" style="padding: 8px 16px; white-space: nowrap;">Fetch</button>
+            </div>
+            <div id="ytImportStatus" style="font-size: 12px; color: var(--text-muted); margin-top: 6px;"></div>
+            <div class="yt-import-grid" id="ytImportGrid"></div>
+            <div class="yt-import-actions hidden" id="ytImportActions">
+                <button class="btn-tiny" id="ytSelectAll">All</button>
+                <button class="btn-tiny" id="ytSelectNone">None</button>
+                <span id="ytSelectedCount" style="font-size: 12px; color: var(--text-muted); margin-left: 8px;"></span>
+                <button class="gen-regen-btn" id="ytSaveSelected" style="margin-left: auto; padding: 8px 20px;">Import Selected</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Floating job tray — non-blocking, supports multiple concurrent generations -->
+<div class="job-tray hidden" id="jobTray"></div>
 {% endblock %}

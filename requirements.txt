@@ -8,6 +8,7 @@ requests
 opencv-python
 mediapipe
 google-genai
+openai>=1.40.0
 Pillow
 gspread
 google-auth

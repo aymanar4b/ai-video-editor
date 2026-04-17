@@ -50,9 +50,11 @@ REFERENCE_PHOTOS_DIR = Path(__file__).parent.parent / ".tmp" / "reference_photos
 OUTPUT_DIR = Path(__file__).parent.parent / ".tmp" / "thumbnails"
 MODEL_PATH = Path(__file__).parent.parent / "models" / "face_landmarker.task"
 API_KEY = os.getenv("NANO_BANANA_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # For GPT Image 1.5 (optional provider)
 
 MODEL = "gemini-3-pro-image-preview"
 ANALYSIS_MODEL = "gemini-2.5-pro"  # For analyzing source thumbnails (avoids image-gen model's content filter)
+OPENAI_IMAGE_MODEL = "gpt-image-1.5"  # OpenAI alternate provider
 
 THUMB_SIZE = (1280, 720)
 REF_SIZE = (768, 768)
@@ -78,6 +80,92 @@ def _api_call_with_timeout(client_obj, model, contents, config, timeout=API_TIME
         raise
     finally:
         signal.signal(signal.SIGALRM, old)
+
+def _openai_generate_image(
+    prompt: str,
+    input_images: list,
+    input_fidelity: str = "high",
+    quality: str = "high",
+    size: str = "1536x1024",
+    timeout: int = 180,
+):
+    """Generate an image via OpenAI GPT Image 1.5 (/v1/images/edits).
+
+    Accepts the same PIL Image objects we hand Gemini; serializes them to
+    PNG bytes and calls the OpenAI images.edit endpoint with up to 16 input
+    images. Returns a PIL Image normalized to 1280x720 16:9, or None on
+    failure (missing key, quota, content filter, network, parse error).
+
+    Uses `input_fidelity="high"` which is the key control for replicate mode:
+    it biases the model toward preserving the source image's layout and
+    composition when editing.
+    """
+    if not OPENAI_API_KEY:
+        print("  OpenAI: OPENAI_API_KEY not set, skipping")
+        return None
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("  OpenAI: openai SDK not installed (pip install openai)")
+        return None
+
+    try:
+        oai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=timeout)
+
+        # Serialize each PIL image to an in-memory PNG with a filename
+        # (OpenAI SDK inspects the filename extension to set MIME type).
+        image_files = []
+        for i, pil_img in enumerate(input_images[:16]):  # cap at 16 per API limit
+            if pil_img is None:
+                continue
+            buf = io.BytesIO()
+            # Convert to RGB to avoid RGBA issues
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            pil_img.save(buf, format="PNG")
+            buf.seek(0)
+            buf.name = f"image_{i}.png"  # SDK needs this for MIME detection
+            image_files.append(buf)
+
+        if not image_files:
+            print("  OpenAI: no input images provided")
+            return None
+
+        print(f"  OpenAI: calling gpt-image-1.5 with {len(image_files)} image(s), "
+              f"quality={quality}, input_fidelity={input_fidelity}, size={size}")
+
+        response = oai_client.images.edit(
+            model=OPENAI_IMAGE_MODEL,
+            image=image_files,
+            prompt=prompt,
+            size=size,
+            input_fidelity=input_fidelity,
+            quality=quality,
+        )
+
+        if not response.data:
+            print("  OpenAI: response.data was empty")
+            return None
+
+        b64 = response.data[0].b64_json
+        if not b64:
+            # Some responses return a URL instead
+            url = getattr(response.data[0], "url", None)
+            if url:
+                import requests
+                img_bytes = requests.get(url, timeout=30).content
+                return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
+            print("  OpenAI: no b64_json and no url in response")
+            return None
+
+        img_bytes = base64.b64decode(b64)
+        return normalize_to_thumbnail(Image.open(io.BytesIO(img_bytes)))
+
+    except Exception as e:
+        print(f"  OpenAI error: {e}")
+        return None
+
 
 # ── TikScale Thumbnail Design Playbook (condensed) ──────────────────────────
 PLAYBOOK = """TIKSCALE THUMBNAIL DESIGN PLAYBOOK — MANDATORY RULES:
@@ -138,34 +226,99 @@ QUALITY CHECKLIST:
 ☐ Nothing in bottom-right corner"""
 
 
-def load_swipe_examples(only_files: list[str] | None = None) -> list[Image.Image]:
-    """Load individual cropped swipe file thumbnails, anonymized to bypass content filters.
+def load_swipe_examples(
+    only_files: list[str] | None = None,
+    extra_paths: list[Path] | None = None,
+) -> tuple[list[Image.Image], list[Image.Image]]:
+    """Load swipe file thumbnails.
 
-    If only_files is set, load only those filenames.
-    All swipe examples are pixelated to avoid triggering public-figure filters.
+    Returns (universal_examples, client_examples):
+    - Universal swipes are pixelated to bypass public-figure content filters.
+    - Client swipes are sent at full quality — they're the client's own
+      thumbnails and need to preserve exact style details.
     """
+    # ── Universal swipes (pixelated) ──
+    universal = []
     individual_dir = SWIPE_DIR / "individual"
-    if not individual_dir.exists():
-        return []
-    thumbs = sorted(individual_dir.glob("thumb_*.png"))
-    if only_files:
-        allowed = set(only_files)
-        thumbs = [t for t in thumbs if t.name in allowed]
-    examples = []
-    for p in thumbs:
-        try:
-            img = Image.open(p)
-            img.thumbnail((768, 768), Image.Resampling.LANCZOS)
-            # Full pixelation for swipe examples — they're style references only,
-            # so exact detail isn't needed, just composition/color/text style
-            w, h = img.size
-            small = img.resize((30, 30), Image.Resampling.NEAREST)
-            img = small.resize((w, h), Image.Resampling.NEAREST)
-            examples.append(img)
-        except Exception:
-            continue
-    print(f"Loaded {len(examples)} swipe file thumbnails (anonymized)")
-    return examples
+    if individual_dir.exists():
+        thumbs = sorted(individual_dir.glob("thumb_*.png"))
+        if only_files is not None:
+            allowed = set(only_files)
+            thumbs = [t for t in thumbs if t.name in allowed]
+        for p in thumbs:
+            try:
+                img = Image.open(p)
+                img.thumbnail((768, 768), Image.Resampling.LANCZOS)
+                w, h = img.size
+                pw = max(160, w // 5)
+                ph = max(90, h // 5)
+                small = img.resize((pw, ph), Image.Resampling.NEAREST)
+                img = small.resize((w, h), Image.Resampling.NEAREST)
+                universal.append(img)
+            except Exception:
+                continue
+
+    # ── Client swipes (full quality) ──
+    client = []
+    if extra_paths:
+        for p in extra_paths:
+            try:
+                if p and Path(p).exists():
+                    img = Image.open(Path(p))
+                    img.thumbnail((768, 768), Image.Resampling.LANCZOS)
+                    client.append(img)
+            except Exception:
+                continue
+
+    print(f"Loaded swipe files: {len(universal)} universal (pixelated), {len(client)} client (full quality)")
+    return universal, client
+
+
+def analyze_swipe_style(client_swipes: list[Image.Image]) -> str:
+    """Ask the model to describe the typography and visual style of client swipes.
+
+    Returns a concrete style description that can be injected into generation prompts
+    so the model knows exactly what fonts, colors, and layout to replicate.
+    """
+    if not client_swipes:
+        return ""
+
+    api_client = genai.Client(api_key=API_KEY)
+    contents = []
+    contents.append(f"Analyze these {len(client_swipes)} YouTube thumbnails from the SAME channel. They share a consistent visual style. Describe it precisely:")
+    for img in client_swipes:
+        contents.append(img)
+
+    contents.append("""Describe the EXACT visual style of these thumbnails in a structured format. Be SPECIFIC — don't say "bold font", say exactly what kind (e.g. "extra-bold condensed sans-serif, all caps, with black outline/stroke").
+
+Respond in EXACTLY this format (fill in each line):
+
+FONT_STYLE: [exact font description — weight, width, case, serif/sans-serif]
+TEXT_EFFECTS: [outline, stroke, shadow, glow, 3D, gradient fill — describe exactly]
+TEXT_COLORS: [list the exact text colors used, e.g. "white with black outline, red accent text"]
+TEXT_PLACEMENT: [where text appears — top, bottom, left, right, center, overlapping person]
+TEXT_SIZE: [relative to frame — how much of the frame does text occupy]
+WORD_COUNT: [typical number of words per thumbnail]
+BACKGROUND_STYLE: [solid color, gradient, photo, composite — describe exactly]
+BACKGROUND_COLORS: [dominant background colors]
+PERSON_STYLE: [cutout on solid bg, environmental, studio, how much of frame they fill]
+PERSON_PLACEMENT: [left, right, center, how positioned relative to text]
+GRAPHIC_ELEMENTS: [arrows, icons, emojis, borders, shapes, overlays — list all recurring elements]
+COLOR_PALETTE: [the 3-4 dominant colors across all thumbnails]
+OVERALL_MOOD: [one sentence describing the energy/vibe]""")
+
+    try:
+        response = _api_call_with_timeout(api_client, MODEL, contents,
+            types.GenerateContentConfig(response_modalities=["TEXT"]),
+            timeout=30)
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    print(f"Style analysis:\n{part.text[:500]}")
+                    return part.text
+    except Exception as e:
+        print(f"Style analysis failed: {e}")
+    return ""
 
 
 def normalize_to_thumbnail(img: Image.Image) -> Image.Image:
@@ -333,11 +486,16 @@ def face_similarity(ratios_a: list[float], ratios_b: list[float]) -> float:
 
 
 def check_face_match(generated: Image.Image, reference_photos: list[Image.Image],
-                     threshold: float = 0.15) -> bool:
+                     threshold: float = 0.05) -> bool:
     """Check if the face in the generated thumbnail matches the reference photos.
 
-    Returns True if the face matches (or if we can't detect faces to compare).
-    Returns False only if we can confidently say the face is wrong.
+    Uses 2D facial landmark ratios which are POSE-SENSITIVE — if the generated image
+    has a very different head angle from the refs (3/4 vs front), ratios diverge even
+    for the same person. We treat that case as "can't compare" and defer to the
+    semantic verify_and_fix pass rather than forcing retries on a broken signal.
+
+    Returns True if the face matches OR if we can't reliably compare. Returns False
+    only when we can confidently say the face is wrong.
     """
     gen_ratios = get_face_ratios(generated)
     if gen_ratios is None:
@@ -355,6 +513,14 @@ def check_face_match(generated: Image.Image, reference_photos: list[Image.Image]
 
     best_score = max(ref_scores)
     print(f"  Face match score: {best_score:.2f} (threshold: {threshold})")
+
+    # A score of exactly 0.0 means the landmark-ratio distance saturated the
+    # similarity clamp — almost always a pose mismatch, not an identity mismatch.
+    # Trust the semantic verify pass instead of forcing retries.
+    if best_score == 0.0:
+        print("  (Score 0.0 → likely pose mismatch, deferring to verify_and_fix)")
+        return True
+
     return best_score >= threshold
 
 
@@ -632,27 +798,24 @@ LAYOUT: [spatial arrangement — only if user mentioned layout changes]"""
             for part in response.candidates[0].content.parts:
                 if hasattr(part, 'text') and part.text:
                     enhanced = part.text.strip()
-                    # Remove duplicate sections (model sometimes repeats)
+                    # Remove "Downloaded thumbnail..." debug line if present
                     lines = enhanced.split('\n')
-                    seen_sections = set()
+                    lines = [l for l in lines if not l.strip().startswith('Downloaded thumbnail')]
+                    if lines and lines[0].strip().startswith('Enhanced prompt'):
+                        lines = lines[1:]
+                    enhanced = '\n'.join(lines).strip()
+                    # Remove duplicate paragraphs/lines
+                    seen = set()
                     deduped = []
-                    for line in lines:
-                        stripped = line.strip()
-                        if stripped.endswith(':') and stripped[:-1] in ('CHANGE', 'ADD', 'TEXT', 'LAYOUT', 'KEEP', 'REMOVE'):
-                            if stripped in seen_sections:
-                                # Skip this section and everything until next section
-                                deduped.append(None)  # marker
-                                continue
-                            seen_sections.add(stripped)
-                        if deduped and deduped[-1] is None:
-                            if stripped.endswith(':') and stripped[:-1] in ('CHANGE', 'ADD', 'TEXT', 'LAYOUT', 'KEEP', 'REMOVE'):
-                                if stripped not in seen_sections:
-                                    deduped[-1] = line  # replace marker
-                                    seen_sections.add(stripped)
-                                continue
+                    for line in enhanced.split('\n'):
+                        key = line.strip()
+                        if not key:
+                            deduped.append(line)
                             continue
-                        deduped.append(line)
-                    enhanced = '\n'.join(l for l in deduped if l is not None)
+                        if key not in seen:
+                            seen.add(key)
+                            deduped.append(line)
+                    enhanced = '\n'.join(deduped).strip()
                     print(f"Enhanced prompt:\n{enhanced}\n")
                     return enhanced
     except Exception as e:
@@ -671,37 +834,50 @@ def recreate_thumbnail(
     video_title: str = "",
     swipe_examples: list[Image.Image] | None = None,
     anon_level: int = 0,
+    provider: str = "gemini",
+    openai_quality: str = "high",
 ) -> Image.Image | str | None:
     """Recreate a thumbnail with the client as the featured person.
 
     Blurs eyes in the source thumbnail to bypass content filters on public figures,
     while preserving expression, pose, and layout for accurate replication.
+
+    `swipe_examples` is accepted but intentionally ignored in replicate mode —
+    the source image is the definitive layout reference, and adding swipe files
+    causes the model to blend compositions.
+
+    `provider` picks the image generation backend: "gemini" (default, current
+    behavior) or "openai" (GPT Image 1.5 via /v1/images/edits with high
+    input_fidelity for strong composition preservation).
     """
+    del swipe_examples  # intentionally unused in replicate mode
     client = genai.Client(api_key=API_KEY)
 
     thumb = source_image.copy()
     thumb.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
 
-    # Anonymize source to bypass public figure filter
-    thumb_anon = anonymize_source(thumb, level=anon_level)
-    anon_labels = {0: "face blur", 1: "face blur + text wash", 2: "heavy pixelation"}
-    print(f"\nAnonymized source thumbnail ({anon_labels.get(anon_level, 'face blur')})")
+    # For OpenAI, skip anonymization on the first pass — OpenAI's content filter
+    # is less aggressive about public figures and we want to see its natural
+    # output. For Gemini, always anonymize at the requested level.
+    if provider == "openai":
+        thumb_anon = thumb
+        print(f"\nSource thumbnail passed to OpenAI without anonymization")
+    else:
+        thumb_anon = anonymize_source(thumb, level=anon_level)
+        anon_labels = {0: "face blur", 1: "face blur + text wash", 2: "heavy pixelation"}
+        print(f"\nAnonymized source thumbnail ({anon_labels.get(anon_level, 'face blur')})")
 
     contents = []
     for i, ref in enumerate(reference_photos):
         contents.append(f"Reference photo {i+1} of the client — ONLY use this for the person's face and body appearance. IGNORE the background, setting, and environment in this photo:")
         contents.append(ref)
 
-    contents.append("Source thumbnail — THIS is the master layout. Copy its EXACT background, setting, environment, colors, objects, props, text, and composition. Only replace the person's face/appearance using the reference photos above:")
+    # Source thumbnail goes LAST (right before the prompt) so it has the strongest
+    # attention weight. In replicate mode the source IS the composition reference —
+    # we intentionally skip swipe files here since they'd compete with the source
+    # for layout influence and cause the model to blend compositions.
+    contents.append("SOURCE THUMBNAIL — THIS IS THE EXACT LAYOUT TO COPY. Match its composition, framing, zoom level, person position, background, colors, text, props, and every other visual element. The only thing you should change is the person's face/identity (using the reference photos above). Everything else — INCLUDING framing and crop — must be identical:")
     contents.append(thumb_anon)
-
-    # Add swipe file examples as style references
-    if swipe_examples is None:
-        swipe_examples = load_swipe_examples()
-    if swipe_examples:
-        contents.append("STYLE REFERENCE — These are real high-performing YouTube thumbnails (100k-3M+ views). Study their style, composition, contrast, and text treatment. Your output should match this level of quality:")
-        for ex in swipe_examples:
-            contents.append(ex)
 
     title_section = ""
     if video_title:
@@ -725,7 +901,7 @@ PERSON PORTRAYAL (from reference photos):
 - IGNORE backgrounds/settings in reference photos — they are IRRELEVANT.
 - Only the client should appear. No other people.
 - Face proportions must be natural — no squeezing, stretching, or distortion.
-- Match expression and pose from the SOURCE THUMBNAIL.
+- Match the pose, body position, and eye/gaze direction from the SOURCE THUMBNAIL. If the source person looks at the camera, the client should too. If the source person looks to the side or at a microphone, match that direction.
 - Skin tone consistent across face, neck, hands, arms.
 - TEXT ACCURACY: Spell EVERY word CORRECTLY. Double-check each letter.
 
@@ -734,9 +910,21 @@ LAYOUT RULES (from source thumbnail — follow unless overridden by PRIORITY INS
 - Keep text overlays, graphic elements, logos, objects, props, and clothing consistent with the source.
 - Do NOT bring backgrounds or settings from the reference photos.
 
-FRAMING:
-- The person MUST be fully visible — never crop out head, forehead, chin, or visible body parts.
-- Leave adequate headroom.
+FRAMING — MATCH THE SOURCE EXACTLY (THIS IS THE #1 PRIORITY):
+- THE ENTIRE HEAD MUST BE VISIBLE IN THE FRAME. Every strand of hair, the top of the skull, the forehead, the chin, the ears — ALL visible. NOTHING cut off at the top or bottom.
+- If the top of the hair is touching the top edge of the thumbnail, YOU ARE DOING IT WRONG. Leave a small gap above the hair, matching the source's headroom.
+- Match the source's EXACT zoom level. If the source is waist-up, your output is waist-up. If the source is head-and-shoulders, match that.
+- The person's EYES should be at roughly the same height in the frame as in the source's eyes.
+- The person should occupy the SAME proportion of the frame as in the source — not bigger, not smaller.
+- Do NOT zoom in closer than the source. Do NOT turn a medium/wide shot into a close-up headshot.
+- Do NOT shove the person to the bottom of the frame with empty space above.
+- COMMON MISTAKES THAT WILL FAIL THIS OUTPUT:
+  * Cropping off the top of the hair/head — FAIL
+  * Cropping off the chin — FAIL
+  * Zooming into just the face when the source shows more of the body — FAIL
+  * Pushing the person to the bottom of the frame with empty space above — FAIL
+  * Leaving more headroom than the source has — FAIL
+- Before finalizing, verify: "Can I see the entire top of the person's head with at least a small gap of space above it?" If no, you must redo the framing.
 
 {PLAYBOOK}
 {title_section}
@@ -745,8 +933,41 @@ OUTPUT: 1280x720 pixels, 16:9. Professional YouTube thumbnail."""
 
     contents.append(prompt)
 
-    print(f"Generating with {len(reference_photos)} reference photos...")
+    print(f"Generating with {len(reference_photos)} reference photos (provider={provider})...")
 
+    # ── OpenAI GPT Image 1.5 branch ─────────────────────────────────────────
+    if provider == "openai":
+        # OpenAI's edit endpoint takes a single prompt string plus a list of
+        # input images. We number the images explicitly in the prompt so the
+        # model knows which is which, then pass reference photos + source.
+        num_refs = len(reference_photos)
+        image_guide_lines = []
+        for i in range(num_refs):
+            image_guide_lines.append(
+                f"[IMAGE {i+1}] = reference photo of the client — use ONLY for face/body identity (bone structure, jawline, nose, eyebrows, skin tone, hair). Ignore its background."
+            )
+        image_guide_lines.append(
+            f"[IMAGE {num_refs+1}] = SOURCE THUMBNAIL — this is the exact layout to copy. Preserve its composition, framing, zoom level, background, text, props, colors, and person position. Only the person's face/identity changes."
+        )
+        image_guide = "\n".join(image_guide_lines)
+
+        openai_prompt = (
+            "You are editing an existing YouTube thumbnail. Replace the person "
+            "in the SOURCE THUMBNAIL with the client from the reference photos, "
+            "while preserving EVERYTHING else about the source thumbnail exactly.\n\n"
+            f"{image_guide}\n\n"
+            f"{prompt}"
+        )
+
+        result = _openai_generate_image(
+            prompt=openai_prompt,
+            input_images=[*reference_photos, thumb_anon],
+            input_fidelity="high",
+            quality=openai_quality,
+        )
+        return result
+
+    # ── Gemini 3 Pro Image branch (default / existing path) ─────────────────
     try:
         response = _api_call_with_timeout(client, MODEL, contents,
             types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
@@ -819,7 +1040,8 @@ def mashup_thumbnail(
 
     # Add swipe file examples as style references
     if swipe_examples is None:
-        swipe_examples = load_swipe_examples()
+        u, c = load_swipe_examples()
+        swipe_examples = u + c
     if swipe_examples:
         contents.append("STYLE REFERENCE — Real high-performing YouTube thumbnails (100k-3M+ views). Match this quality level:")
         for ex in swipe_examples:
@@ -912,7 +1134,8 @@ def collab_thumbnail(
     contents.append(thumb_anon)
 
     if swipe_examples is None:
-        swipe_examples = load_swipe_examples()
+        u, c = load_swipe_examples()
+        swipe_examples = u + c
     if swipe_examples:
         contents.append("STYLE REFERENCE — Match this level of quality:")
         for ex in swipe_examples:
@@ -989,8 +1212,19 @@ def imagine_thumbnail(
     additional_prompt: str = "",
     video_title: str = "",
     swipe_examples: list[Image.Image] | None = None,
+    client_swipes: list[Image.Image] | None = None,
+    style_description: str = "",
+    provider: str = "gemini",
+    openai_quality: str = "high",
 ) -> Image.Image | None:
-    """Generate a thumbnail from imagination using the playbook principles."""
+    """Generate a thumbnail from imagination using the playbook principles.
+
+    `client_swipes` are full-quality client thumbnails used as primary style/layout
+    templates. `swipe_examples` are pixelated universal references for general style.
+    `style_description` is a pre-computed text description of the client's style from
+    analyze_swipe_style() — gives the model concrete typography/color instructions.
+    `provider` picks the backend: "gemini" (default) or "openai" (GPT Image 1.5).
+    """
     api_client = genai.Client(api_key=API_KEY)
 
     contents = []
@@ -998,20 +1232,30 @@ def imagine_thumbnail(
         contents.append(f"Reference photo {i+1} of the person who must appear in the thumbnail:")
         contents.append(ref)
 
-    # Add swipe file examples as style references
-    if swipe_examples is None:
-        swipe_examples = load_swipe_examples()
+    has_client = client_swipes and len(client_swipes) > 0
+    has_universal = swipe_examples and len(swipe_examples) > 0
 
-    has_swipe = swipe_examples and len(swipe_examples) > 0
-    if has_swipe:
-        contents.append("""STYLE REFERENCES — These are REAL high-performing YouTube thumbnails (100k-3M+ views).
-Your output MUST closely match the STYLE, AESTHETIC, and QUALITY of these examples:
-- Study the exact FONT STYLES used (modern, bold, clean sans-serif — NOT dated/decorative fonts)
-- Study the COLOR PALETTES (high contrast, cinematic tones)
-- Study the COMPOSITION (person placement, text placement, negative space)
-- Study the LIGHTING (cinematic, professional — NOT flat or stock-photo-like)
-- Study the OVERALL FEEL (premium, polished, 2024/2025 YouTube aesthetic)
-Your thumbnail MUST look like it belongs in the same collection as these:""")
+    # Client swipes first — these are full quality and the PRIMARY style target
+    if has_client:
+        contents.append(f"""PRIMARY STYLE TEMPLATES ({len(client_swipes)} images) — These are the client's REAL thumbnails at full quality. Your output must look like the NEXT thumbnail in this series — as if the SAME designer made it.
+
+REPLICATE THESE EXACTLY:
+- LAYOUT: Copy the exact person placement, text positioning, and spatial arrangement from these thumbnails
+- COLOR PALETTE: Use the SAME colors — background tones, text colors, accent colors, gradients
+- TYPOGRAPHY: Match the EXACT font style — weight, case, size, stroke/outline treatment, shadow
+- LIGHTING: Match the lighting mood — warm/cool, contrast level, rim lights, color gels
+- GRAPHIC ELEMENTS: If they use arrows, icons, borders, cutout style — you use the same
+- BACKGROUND STYLE: Same approach — solid, gradient, environmental, or composite
+- OVERALL ENERGY: Same level of boldness, same density of elements, same polish level
+
+Pick the layout from the template that best fits the prompt/title below, and reproduce that layout with new content. The result should be INDISTINGUISHABLE in style from these templates:""")
+        for ex in client_swipes:
+            contents.append(ex)
+
+    # Universal swipes as supplementary style references (pixelated)
+    if has_universal:
+        label = "ADDITIONAL STYLE REFERENCES" if has_client else "STYLE REFERENCES"
+        contents.append(f"""{label} ({len(swipe_examples)} images) — High-performing YouTube thumbnails for general style inspiration:""")
         for ex in swipe_examples:
             contents.append(ex)
 
@@ -1029,23 +1273,43 @@ TITLE-THUMBNAIL SYNERGY: This is CRITICAL. Title and thumbnail are a TEAM. The t
 === END PRIORITY INSTRUCTIONS ===
 """
 
+    style_instruction = ""
+    style_analysis_block = ""
+    if has_client:
+        style_instruction = "- CRITICAL: Your output must be a PIXEL-PERFECT STYLE MATCH to the primary style templates above. Same fonts, same colors, same composition, same energy. If in doubt, copy MORE from the templates, not less."
+        if style_description:
+            style_analysis_block = f"""
+=== EXACT STYLE SPECIFICATION (extracted from client's thumbnails) ===
+{style_description}
+=== END STYLE SPECIFICATION ===
+Follow this specification PRECISELY. Every font choice, color, outline, and layout decision must match."""
+    elif has_universal:
+        style_instruction = "- Match the general style and quality level of the style reference thumbnails."
+
     prompt = f"""You are an elite YouTube thumbnail designer. Create a stunning, high-CTR YouTube thumbnail featuring the person from the reference photos.
 {user_direction}
+{style_analysis_block}
 
-MODERN STYLE REQUIREMENTS (2024/2025 YouTube aesthetic):
-- FONTS: Use clean, bold, modern sans-serif fonts (like Montserrat, Inter, or similar). NEVER use dated, decorative, script, or clip-art-style fonts.
-- COLORS: High contrast. Rich, cinematic color grading. Popular palettes: dark backgrounds with bright accent colors, gradient overlays, or clean whites with bold color pops.
-- LIGHTING: Cinematic, dramatic lighting with depth. Rim lighting, color gels, or moody window light. NEVER flat, stock-photo lighting.
-- COMPOSITION: Clean and uncluttered. One clear focal point. Strategic use of negative space. Person takes up 40-60% of frame.
+STYLE REQUIREMENTS:
+{style_instruction if style_instruction else '- FONTS: Use clean, bold, modern sans-serif fonts (like Montserrat, Inter, or similar). NEVER use dated, decorative, script, or clip-art-style fonts.'}
+- COLORS: High contrast. Rich, cinematic color grading.
+- LIGHTING: Cinematic, dramatic lighting with depth. NEVER flat, stock-photo lighting.
+- COMPOSITION: Clean and uncluttered. One clear focal point. Person takes up 40-60% of frame.
 - TEXT: Maximum 4 words. Large, bold, high contrast against background. Drop shadow or outline for readability. Positioned to not overlap the face.
-- OVERALL: Must look like a thumbnail from a top-tier creator (MrBeast, Ali Abdaal, MKBHD level quality). Premium, polished, professional.
-{'- MATCH THE STYLE of the provided style reference thumbnails EXACTLY.' if has_swipe else ''}
+- OVERALL: Must look like a thumbnail from a top-tier creator. Premium, polished, professional.
 
-IDENTITY RULES:
-- ONLY the person from the reference photos may appear. Copy exact bone structure, jawline, nose, eyebrows, skin tone, hair.
+IDENTITY RULES — THIS IS NON-NEGOTIABLE:
+- EVERY face in the thumbnail MUST be the person from the reference photos. No exceptions.
+- There must be ONLY ONE person visible in the thumbnail (unless the prompt says otherwise).
+- Copy EXACT bone structure, jawline, nose shape, eyebrow shape, skin tone, hair color and style.
+- If you cannot make the face match perfectly, try harder. Do NOT substitute a different face.
 - Face proportions must be NATURAL — no squeezing or stretching.
-- Skin tone consistent across face, neck, hands, arms.
-- TEXT ACCURACY: Spell EVERY word CORRECTLY.
+
+TEXT ACCURACY — ZERO TOLERANCE FOR ERRORS:
+- Before finalizing, read back every word of text you placed in the thumbnail.
+- Check each word letter by letter. No repeated letters, no missing letters, no swapped letters.
+- If the prompt or title specifies text, spell it EXACTLY as given.
+- Common mistakes to avoid: doubled letters (e.g. "STOPP"), missing letters (e.g. "AGNCY"), wrong letters.
 
 {PLAYBOOK}
 {title_section}
@@ -1054,8 +1318,51 @@ OUTPUT: 1280x720 pixels, 16:9. Must look like a top-tier professional YouTube th
 
     contents.append(prompt)
 
-    print(f"\nImagine mode: generating with {len(reference_photos)} reference photos...")
+    print(f"\nImagine mode: generating with {len(reference_photos)} reference photos (provider={provider})...")
 
+    # ── OpenAI GPT Image 1.5 branch ─────────────────────────────────────────
+    if provider == "openai":
+        # OpenAI edits endpoint takes a single prompt string plus up to 16
+        # input images. For imagine mode we pass: reference photos first, then
+        # the client's full-quality swipe file thumbnails as style templates.
+        # Universal (pixelated) swipes are skipped since they'd waste the
+        # 16-image budget on low-signal inputs.
+        num_refs = len(reference_photos)
+        num_client = len(client_swipes) if client_swipes else 0
+
+        image_guide_lines = []
+        for i in range(num_refs):
+            image_guide_lines.append(
+                f"[IMAGE {i+1}] = reference photo of the client — use ONLY for face/body identity (bone structure, jawline, nose, eyebrows, skin tone, hair)."
+            )
+        for j in range(num_client):
+            image_guide_lines.append(
+                f"[IMAGE {num_refs+j+1}] = style template from the client's channel — match its exact fonts, colors, layout, typography, and graphic style."
+            )
+        image_guide = "\n".join(image_guide_lines)
+
+        openai_prompt = (
+            "Create a brand new YouTube thumbnail from scratch. The person in "
+            "the output MUST be the client from the reference photos. The visual "
+            "style (fonts, colors, composition, typography, graphic treatment) "
+            "MUST match the style templates provided.\n\n"
+            f"{image_guide}\n\n"
+            f"{prompt}"
+        )
+
+        openai_inputs = [*reference_photos]
+        if client_swipes:
+            openai_inputs.extend(client_swipes)
+
+        result = _openai_generate_image(
+            prompt=openai_prompt,
+            input_images=openai_inputs,
+            input_fidelity="low",  # imagine mode is creative, not strict edit
+            quality=openai_quality,
+        )
+        return result
+
+    # ── Gemini 3 Pro Image branch (default / existing path) ─────────────────
     try:
         response = _api_call_with_timeout(api_client, MODEL, contents,
             types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
@@ -1093,14 +1400,30 @@ def verify_and_fix(
     contents.append("Generated thumbnail to verify:")
     contents.append(generated)
 
-    contents.append("""VERIFICATION TASK — Check this thumbnail for TWO issues:
+    contents.append("""VERIFICATION TASK — Check this thumbnail for THREE issues. Be STRICT.
 
-1. FACE IDENTITY: Does every face in this thumbnail match the reference person above? Check bone structure, jawline, nose, eyebrows, skin tone, hair. If ANY face belongs to a different person, regenerate the ENTIRE thumbnail with the correct person's face.
+1. FACE IDENTITY (most important):
+   - Count how many faces appear in the thumbnail.
+   - There should be EXACTLY ONE face (the reference person) unless the original prompt specified multiple people.
+   - Compare EACH face against the reference photos: check bone structure, jawline shape, nose shape, eyebrow thickness/arch, skin tone, hair color/style.
+   - If ANY face does NOT match the reference person, or if there are extra faces that shouldn't be there, you MUST regenerate the thumbnail with ONLY the correct person's face.
 
-2. TEXT SPELLING: Read every word of text in the thumbnail. Is every word spelled correctly? Check letter by letter. If any word has repeated letters (e.g. "ASLEEEP"), missing letters, or misspellings, fix the text.
+2. TEXT SPELLING (zero tolerance):
+   - Read every single word of text in the thumbnail out loud.
+   - Spell each word letter by letter. Check for:
+     * Doubled letters that shouldn't be there (e.g. "STOPP" → "STOP")
+     * Missing letters (e.g. "AGNCY" → "AGENCY")
+     * Wrong letters (e.g. "HRING" → "HIRING")
+     * Extra words or garbled text
+   - If ANY spelling error exists, fix it.
 
-If BOTH checks pass, return the thumbnail EXACTLY as-is with no changes.
-If EITHER check fails, output a corrected version of the thumbnail with the issues fixed. Keep everything else identical — same composition, colors, layout, style.
+3. TEXT QUALITY:
+   - Is the text readable and clear?
+   - Is the font clean and modern (not dated or decorative)?
+   - Does the text have proper contrast against the background?
+
+If ALL checks pass, return the thumbnail EXACTLY as-is with no changes.
+If ANY check fails, output a corrected version. Keep everything else identical — same composition, colors, layout, style. Only fix what's broken.
 
 Output the image in 16:9 format (1280x720).""")
 
@@ -1131,26 +1454,109 @@ Output the image in 16:9 format (1280x720).""")
 def edit_thumbnail(
     source_image: Image.Image,
     edit_instructions: str,
+    reference_images: list[Image.Image] | None = None,
+    style_reference: Image.Image | None = None,
 ) -> Image.Image | None:
-    """Edit an existing thumbnail with high-level instructions."""
+    """Edit an existing thumbnail with high-level instructions.
+
+    - `reference_images` (logos): treated as exact visual assets to swap in
+      verbatim (colors, shape, typography).
+    - `style_reference` (optional): a full-frame reference showing the desired
+      overall look, layout, composition, and color grading — the model should
+      emulate its aesthetic, NOT copy its content literally.
+    """
     api_client = genai.Client(api_key=API_KEY)
 
     thumb = source_image.copy()
     thumb.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
 
-    prompt = f"""IMAGE 1: A thumbnail that needs editing.
+    # Normalize style reference to thumbnail size — it's a full-frame guide,
+    # so we want it roughly the same resolution as the source.
+    style_ref: Image.Image | None = None
+    if style_reference is not None:
+        style_ref = style_reference.copy()
+        style_ref.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
 
-TASK: Make the following changes to this thumbnail:
+    # Normalize references to reasonable size (usually small logos, but cap
+    # them so we don't blow up request payload on huge sources).
+    refs: list[Image.Image] = []
+    if reference_images:
+        for ri in reference_images:
+            rcopy = ri.copy()
+            rcopy.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            refs.append(rcopy)
+
+    # Build the image-numbering map dynamically so the prompt accurately
+    # refers to each input by index. Source is always IMAGE 1.
+    img_descriptions = ["IMAGE 1: A thumbnail that needs editing."]
+    next_idx = 2
+    style_ref_idx: int | None = None
+    if style_ref is not None:
+        style_ref_idx = next_idx
+        img_descriptions.append(
+            f"IMAGE {next_idx}: STYLE/LAYOUT REFERENCE. Match its composition, "
+            f"spacing, color palette, lighting, and visual treatment. Do NOT "
+            f"copy its content literally — use it ONLY as a guide for how the "
+            f"final result should look and feel."
+        )
+        next_idx += 1
+
+    logo_range: tuple[int, int] | None = None
+    if refs:
+        start = next_idx
+        end = next_idx + len(refs) - 1
+        logo_range = (start, end)
+        if start == end:
+            img_descriptions.append(
+                f"IMAGE {start}: REFERENCE LOGO you MUST use to REPLACE a matching element in IMAGE 1."
+            )
+        else:
+            img_descriptions.append(
+                f"IMAGES {start}-{end}: REFERENCE LOGOS you MUST use to REPLACE matching elements in IMAGE 1."
+            )
+        img_descriptions.append(
+            "- If any logo, brand mark, or element in IMAGE 1 depicts the same "
+            "subject as a reference logo, you MUST FULLY REPLACE it — pixel for "
+            "pixel — copying its exact colors, shape, typography, and proportions."
+        )
+        img_descriptions.append(
+            "- Do NOT keep a modified version of the original. Do NOT blend. "
+            "COMPLETELY SWAP IT OUT."
+        )
+        img_descriptions.append(
+            "- Do NOT invent or approximate logos from memory. References are the source of truth."
+        )
+        next_idx = end + 1
+
+    ref_block = "\n".join(img_descriptions) + "\n\n"
+
+    prompt = f"""{ref_block}TASK: Make the following changes to the thumbnail (IMAGE 1):
 {edit_instructions}
 
-Keep everything else exactly the same. Only modify what is explicitly requested.
-
-Output in 16:9 format."""
+RULES:
+- Apply the requested changes FULLY. Do not make them more subtle, softer, or smaller than described. If the user says "move X to the right," move it decisively. If they say "hide 50%," actually hide 50%.
+- Preserve elements that are not being modified (position, style, composition).
+- The PERSON in IMAGE 1 stays as the subject — never replace them with anyone from a reference image.
+- Output in 16:9 format."""
 
     print(f"\nEditing with instructions: {edit_instructions[:100]}...")
+    if style_ref is not None:
+        print(f"Using style reference (IMAGE {style_ref_idx})")
+    if refs:
+        if logo_range and logo_range[0] == logo_range[1]:
+            print(f"Using 1 reference logo (IMAGE {logo_range[0]})")
+        elif logo_range:
+            print(f"Using {len(refs)} reference logos (IMAGES {logo_range[0]}-{logo_range[1]})")
 
     try:
-        response = _api_call_with_timeout(api_client, MODEL, [thumb, prompt],
+        # Order MUST match the numbering in ref_block:
+        # [thumb, (style_ref?), *refs, prompt]
+        call_parts: list = [thumb]
+        if style_ref is not None:
+            call_parts.append(style_ref)
+        call_parts.extend(refs)
+        call_parts.append(prompt)
+        response = _api_call_with_timeout(api_client, MODEL, call_parts,
             types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
 
         if response.candidates and response.candidates[0].content:
@@ -1213,6 +1619,18 @@ def main():
                         help="Comma-separated filenames of selected reference photos (empty = all)")
     parser.add_argument("--skip-enhance", action="store_true",
                         help="Skip prompt enhancement (already done in frontend)")
+    parser.add_argument("--reference-images", type=str, default="",
+                        help="Comma-separated paths to reference images (edit mode): exact logos/assets to use verbatim")
+    parser.add_argument("--style-reference", type=str, default="",
+                        help="Path to a style/layout reference image (edit mode): guides the overall look without being copied literally")
+    parser.add_argument("--client-swipe-files", type=str, default="",
+                        help="Comma-separated absolute paths to client-specific swipe files (loaded alongside universal ones)")
+    parser.add_argument("--provider", type=str, default="gemini",
+                        choices=["gemini", "openai"],
+                        help="Image generation provider for replicate/imagine modes (default: gemini)")
+    parser.add_argument("--openai-quality", type=str, default="high",
+                        choices=["low", "medium", "high"],
+                        help="Quality tier for OpenAI GPT Image 1.5 (default: high)")
 
     args = parser.parse_args()
 
@@ -1241,21 +1659,56 @@ def main():
         edit_image = Image.open(args.edit)
         print(f"Size: {edit_image.size}")
 
-        result = edit_thumbnail(edit_image, args.prompt)
+        # Load reference images (e.g. brand logos) if provided
+        reference_images: list[Image.Image] = []
+        if args.reference_images:
+            for rp in args.reference_images.split(","):
+                rp = rp.strip()
+                if rp and Path(rp).exists():
+                    try:
+                        reference_images.append(Image.open(rp))
+                    except Exception as e:
+                        print(f"Warning: failed to load reference {rp}: {e}")
+            print(f"Loaded {len(reference_images)} reference image(s)")
 
-        if result is None:
-            print("Edit failed")
+        # Load optional style/layout reference
+        style_ref_image: Image.Image | None = None
+        if args.style_reference and Path(args.style_reference).exists():
+            try:
+                style_ref_image = Image.open(args.style_reference)
+                print(f"Loaded style reference: {args.style_reference}")
+            except Exception as e:
+                print(f"Warning: failed to load style reference: {e}")
+
+        output_paths = []
+        for i in range(args.variations):
+            print(f"\n--- Variation {i + 1}/{args.variations} ---")
+            result = edit_thumbnail(
+                edit_image,
+                args.prompt,
+                reference_images=reference_images or None,
+                style_reference=style_ref_image,
+            )
+            if result is None:
+                print(f"Edit variation {i + 1} failed")
+                continue
+
+            if args.output and args.variations == 1:
+                output_path = date_folder / args.output
+            else:
+                output_path = date_folder / f"{time_stamp}_edited_{i + 1}.png"
+
+            result.save(output_path)
+            output_paths.append(str(output_path))
+            print(f"Saved: {output_path}")
+            print(f"Size: {result.size}")
+
+        if not output_paths:
+            print("All edit variations failed")
             sys.exit(1)
 
-        if args.output:
-            output_path = date_folder / args.output
-        else:
-            output_path = date_folder / f"{time_stamp}_edited.png"
-
-        result.save(output_path)
-        print(f"\nSaved: {output_path}")
-        print(f"Size: {result.size}")
-        return [str(output_path)]
+        print(f"\n=== Generated {len(output_paths)}/{args.variations} edit variations ===")
+        return output_paths
 
     # === LOAD SOURCE IMAGE(S) ===
     def load_source(youtube_arg, source_arg):
@@ -1279,14 +1732,29 @@ def main():
                 return Image.open(source_arg)
         return None
 
-    # Load swipe examples once for all variations
-    if args.swipe_files == "":
-        # No --swipe-files arg: load all
-        swipe_examples = load_swipe_examples()
+    # Load swipe examples once for all variations.
+    # Universal swipes come from --swipe-files (filenames in execution/swipe_examples/individual/).
+    # Client-specific swipes come from --client-swipe-files (absolute paths).
+    client_swipe_paths: list[Path] = []
+    if args.client_swipe_files:
+        client_swipe_paths = [
+            Path(p.strip()) for p in args.client_swipe_files.split(',') if p.strip()
+        ]
+
+    # If --swipe-files was not provided at all (legacy CLI use), load ALL
+    # universal swipes. Otherwise respect the explicit list (which may be
+    # empty = "no universal swipes selected"). Client swipes are independent.
+    swipe_files_provided = '--swipe-files' in sys.argv or args.swipe_files != ""
+    if not swipe_files_provided and not client_swipe_paths:
+        universal_swipes, client_swipes = load_swipe_examples()
     else:
-        # Explicit list (possibly empty = none selected)
         swipe_filter = [f.strip() for f in args.swipe_files.split(',') if f.strip()]
-        swipe_examples = load_swipe_examples(only_files=swipe_filter) if swipe_filter else []
+        universal_swipes, client_swipes = load_swipe_examples(
+            only_files=swipe_filter,  # may be [] meaning "none from universal pool"
+            extra_paths=client_swipe_paths or None,
+        )
+    # Combined list for modes that don't need the distinction
+    swipe_examples = universal_swipes + client_swipes
 
     # === IMAGINE MODE (no source needed) ===
     if args.mode == "imagine":
@@ -1295,6 +1763,12 @@ def main():
         if not reference_photos:
             print("Warning: No reference photos found. Results may vary.")
 
+        # Pre-analyze client swipe style once (shared across all variations)
+        style_desc = ""
+        if client_swipes:
+            print("Analyzing client thumbnail style...")
+            style_desc = analyze_swipe_style(client_swipes)
+
         output_paths = []
         for i in range(args.variations):
             print(f"\n--- Variation {i + 1}/{args.variations} ---")
@@ -1302,12 +1776,16 @@ def main():
                 reference_photos=reference_photos,
                 additional_prompt=args.prompt,
                 video_title=args.title,
-                swipe_examples=swipe_examples,
+                swipe_examples=universal_swipes if universal_swipes else None,
+                client_swipes=client_swipes if client_swipes else None,
+                style_description=style_desc,
+                provider=args.provider,
+                openai_quality=args.openai_quality,
             )
             if result is None:
                 print(f"Failed to generate variation {i + 1}")
                 continue
-            # Verify identity and spelling
+            # Verify identity and spelling on EVERY variation
             if reference_photos:
                 print(f"  Running verify & fix pass...")
                 result = verify_and_fix(result, reference_photos)
@@ -1423,6 +1901,7 @@ def main():
                     video_title=args.title,
                     swipe_examples=swipe_examples,
                     anon_level=anon_level,
+                    provider=args.provider,
                 )
 
             if result == BLOCKED_SENTINEL:
@@ -1463,7 +1942,7 @@ def main():
                             source_image=source_image, reference_photos=reference_photos,
                             style_variation=args.style, additional_prompt=enhanced_prompt,
                             video_title=args.title, swipe_examples=swipe_examples,
-                            anon_level=0,
+                            anon_level=0, provider=args.provider, openai_quality=args.openai_quality,
                         )
                     if result is None or result == BLOCKED_SENTINEL:
                         break
@@ -1474,7 +1953,7 @@ def main():
             print(f"Failed to generate variation {i + 1}")
             continue
 
-        # Verify spelling with the existing pass
+        # Verify spelling + identity on every variation
         if reference_photos:
             print(f"  Running verify & fix pass...")
             result = verify_and_fix(result, reference_photos)

@@ -35,6 +35,64 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB upload limit
 # Task tracking
 tasks = {}
 
+# Concurrency cap for thumbnail generation. Default is effectively unlimited —
+# every submitted job runs immediately. Set THUMB_CONCURRENCY env var to a small
+# integer (e.g. 2) if you start hitting Gemini 429s or local resource limits.
+THUMB_CONCURRENCY = int(os.getenv('THUMB_CONCURRENCY', '999'))
+thumb_sem = threading.Semaphore(THUMB_CONCURRENCY)
+
+
+def _extract_error_from_log(full_log: str, returncode: int, default: str = "Generation failed.") -> str:
+    """Pull a human-readable error from a subprocess log instead of
+    surfacing a generic "Check logs" message to the UI.
+
+    Priority order:
+      1. Known rate-limit / quota strings
+      2. Known OpenAI-specific error lines
+      3. The last Python Traceback's final line (the actual exception)
+      4. The last line starting with "Error:" or "ERROR"
+      5. If exit code != 0, the final non-empty log line
+      6. Default fallback
+    """
+    if not full_log:
+        return default
+
+    lines = [ln.strip() for ln in full_log.splitlines() if ln.strip()]
+    full = "\n".join(lines)
+
+    # Rate limit / quota
+    if "429" in full or "RESOURCE_EXHAUSTED" in full:
+        return "Gemini API quota exhausted — wait and retry."
+    if "insufficient_quota" in full or "You exceeded your current quota" in full:
+        return "OpenAI API quota exhausted — check billing."
+    if "invalid_api_key" in full or "Incorrect API key" in full:
+        return "OpenAI API key is invalid — check OPENAI_API_KEY in .env"
+    if "OPENAI_API_KEY not set" in full:
+        return "OPENAI_API_KEY is empty — paste your OpenAI key into .env and restart."
+    if "content_policy_violation" in full or "safety system" in full.lower():
+        return "Blocked by OpenAI content filter."
+
+    # Python traceback — find the last exception line
+    last_traceback_idx = None
+    for i, ln in enumerate(lines):
+        if "Traceback (most recent call last)" in ln:
+            last_traceback_idx = i
+    if last_traceback_idx is not None:
+        # The exception is usually the last line of the traceback block
+        for ln in reversed(lines[last_traceback_idx:]):
+            if ln and not ln.startswith("File ") and not ln.startswith("  "):
+                return f"Crash: {ln[:200]}"
+
+    # Last "Error:" or "ERROR" line
+    for ln in reversed(lines):
+        if ln.startswith("Error:") or ln.startswith("ERROR") or ln.startswith("OpenAI error:"):
+            return ln[:200]
+
+    if returncode != 0 and lines:
+        return f"Exit {returncode}: {lines[-1][:200]}"
+
+    return default
+
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -193,46 +251,99 @@ def api_thumbnails():
     client_slug = request.form.get('client', '')
     mode = request.form.get('mode', 'replicate')
     swipe_files = request.form.get('swipe_files', '')
+    client_swipes = request.form.get('client_swipe_files', '')  # comma-separated filenames
     selected_refs = request.form.get('selected_refs', '')
     skip_enhance = request.form.get('skip_enhance') == 'true'
+    swipe_source_pool = request.form.get('swipe_source_pool', '')
+    swipe_source_name = request.form.get('swipe_source_name', '')
+    swipe_source_slug = request.form.get('swipe_source_slug', '')
+    provider = request.form.get('provider', 'gemini')
+    openai_quality = request.form.get('openai_quality', 'high')
 
     # Handle guest photo uploads (collab mode)
+    # Filenames namespaced by task_id so concurrent jobs don't clobber each other.
     guest_photo_paths = []
     if mode == 'collab' and 'guest_photos' in request.files:
         guest_files = request.files.getlist('guest_photos')
         for gf in guest_files:
             if gf.filename:
-                gp = TMP_DIR / f"guest_{gf.filename}"
+                gp = TMP_DIR / f"guest_{task_id}_{gf.filename}"
                 gf.save(str(gp))
                 guest_photo_paths.append(str(gp))
 
-    # Handle image uploads
+    # Handle swipe file as source (resolve to a file path)
     source_path = None
-    if 'image' in request.files:
+    if swipe_source_pool and swipe_source_name:
+        if swipe_source_pool == 'client' and swipe_source_slug:
+            swipe_src = CLIENTS_DIR / swipe_source_slug / "swipe_examples" / swipe_source_name
+        else:
+            swipe_src = EXECUTION_DIR / "swipe_examples" / "individual" / swipe_source_name
+        if swipe_src.exists():
+            source_path = swipe_src
+            print(f"Using swipe file as source: {swipe_src}")
+
+    # Handle image uploads
+    if source_path is None and 'image' in request.files:
         f = request.files['image']
         if f.filename:
-            source_path = TMP_DIR / f"thumb_source_{f.filename}"
+            source_path = TMP_DIR / f"thumb_source_{task_id}_{f.filename}"
             f.save(str(source_path))
+            print(f"[{task_id}] Uploaded source image saved to {source_path} "
+                  f"({source_path.stat().st_size} bytes)")
+        else:
+            print(f"[{task_id}] Image field present but filename empty")
+    elif source_path is None and mode != 'imagine':
+        print(f"[{task_id}] No source provided: youtube_url={bool(youtube_url)}, "
+              f"image_in_files={'image' in request.files}, mode={mode}")
 
     source_path2 = None
     if 'image2' in request.files:
         f2 = request.files['image2']
         if f2.filename:
-            source_path2 = TMP_DIR / f"thumb_source2_{f2.filename}"
+            source_path2 = TMP_DIR / f"thumb_source2_{task_id}_{f2.filename}"
             f2.save(str(source_path2))
 
     tasks[task_id] = {
-        'state': 'running',
-        'progress': 10,
-        'status': 'Starting thumbnail generation...',
+        'state': 'queued',
+        'progress': 5,
+        'status': 'Queued — waiting for an open slot...',
         'log': '',
         'thumbnails': [],
+        'cancelled': False,
+        'proc': None,
     }
 
     def run_thumbnails():
+        # Cap concurrency: excess jobs sit in 'queued' state until a slot frees up.
+        with thumb_sem:
+            # If user cancelled while we were queued, exit immediately without
+            # spawning the subprocess.
+            if tasks[task_id].get('cancelled'):
+                tasks[task_id]['state'] = 'cancelled'
+                tasks[task_id]['status'] = 'Cancelled before starting'
+                tasks[task_id]['progress'] = 100
+                return
+            try:
+                tasks[task_id]['state'] = 'running'
+                tasks[task_id]['status'] = 'Starting thumbnail generation...'
+                tasks[task_id]['progress'] = 10
+                _run_thumbnail_job(
+                    task_id, mode, youtube_url, youtube_url2, source_path, source_path2,
+                    variations, refs, skip_match, prompt, video_title, client_slug,
+                    swipe_files, client_swipes, selected_refs, skip_enhance, guest_photo_paths,
+                    provider, openai_quality,
+                )
+            except Exception as e:
+                tasks[task_id]['state'] = 'error'
+                tasks[task_id]['error'] = str(e)
+
+    def _run_thumbnail_job(
+        task_id, mode, youtube_url, youtube_url2, source_path, source_path2,
+        variations, refs, skip_match, prompt, video_title, client_slug,
+        swipe_files, client_swipes, selected_refs, skip_enhance, guest_photo_paths,
+        provider="gemini", openai_quality="high",
+    ):
         try:
-            tasks[task_id]['status'] = 'Downloading source thumbnail...'
-            tasks[task_id]['progress'] = 10
 
             cmd = [PYTHON, "-u", str(EXECUTION_DIR / "recreate_thumbnails.py")]
             cmd += ["--mode", mode]
@@ -271,10 +382,29 @@ def api_thumbnails():
                 cmd += ["--selected-refs", selected_refs]
             if swipe_files:
                 cmd += ["--swipe-files", swipe_files]
+            # Resolve client-specific swipe filenames into absolute paths.
+            # The frontend sends just the filenames; they live under
+            # .tmp/clients/<slug>/swipe_examples/.
+            if client_swipes and client_slug:
+                client_swipe_dir = CLIENTS_DIR / client_slug / "swipe_examples"
+                resolved = []
+                for name in client_swipes.split(','):
+                    name = name.strip()
+                    if not name:
+                        continue
+                    p = client_swipe_dir / name
+                    if p.exists():
+                        resolved.append(str(p))
+                if resolved:
+                    cmd += ["--client-swipe-files", ",".join(resolved)]
             if skip_enhance:
                 cmd.append("--skip-enhance")
             if guest_photo_paths:
                 cmd += ["--guest-photos", ",".join(guest_photo_paths)]
+            if provider and provider != "gemini":
+                cmd += ["--provider", provider]
+            if provider == "openai" and openai_quality:
+                cmd += ["--openai-quality", openai_quality]
 
             num_vars = int(variations)
             log_lines = []
@@ -291,6 +421,8 @@ def api_thumbnails():
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=str(BASE_DIR)
             )
+            # Expose the proc so the /cancel endpoint can kill it
+            tasks[task_id]['proc'] = proc
 
             # Kill process after 10 minutes if it hangs
             kill_timer = threading.Timer(600, lambda: proc.kill())
@@ -341,6 +473,14 @@ def api_thumbnails():
 
             proc.wait()
             kill_timer.cancel()
+
+            # If user cancelled while running, short-circuit before doing
+            # any cleanup or "no thumbnails generated" error reporting.
+            if tasks[task_id].get('cancelled'):
+                tasks[task_id]['state'] = 'cancelled'
+                tasks[task_id]['status'] = 'Cancelled'
+                tasks[task_id]['progress'] = 100
+                return
             with open(debug_log, "a") as dl:
                 dl.write(f"EXIT CODE: {proc.returncode}\n")
                 dl.write(f"TIMESTAMP parsed: {run_timestamp}\n")
@@ -388,6 +528,7 @@ def api_thumbnails():
                     import json as _json
                     meta = {
                         'mode': mode,
+                        'provider': provider,
                         'youtube_url': youtube_url,
                         'youtube_url2': youtube_url2,
                         'prompt': prompt,
@@ -396,6 +537,7 @@ def api_thumbnails():
                         'variations': variations,
                         'refs': refs,
                         'swipe_files': swipe_files,
+                        'client_swipe_files': client_swipes,
                     }
                     # Save source thumbnail for reference
                     if youtube_url and run_timestamp:
@@ -430,14 +572,12 @@ def api_thumbnails():
                 except Exception:
                     pass  # Metadata is non-critical
             else:
-                # Extract a meaningful error from the log
+                # Extract a meaningful error from the log instead of "Check logs"
                 full_log = '\n'.join(log_lines)
-                if '429' in full_log or 'RESOURCE_EXHAUSTED' in full_log:
-                    error_msg = 'Gemini API quota exhausted. Upgrade to a paid plan or wait for quota reset.'
-                elif proc.returncode != 0:
-                    error_msg = 'Thumbnail generation failed. Check logs for details.'
-                else:
-                    error_msg = 'No thumbnails were generated. All variations failed.'
+                error_msg = _extract_error_from_log(
+                    full_log, proc.returncode,
+                    default="No thumbnails were generated. All variations failed."
+                )
                 tasks[task_id]['state'] = 'error'
                 tasks[task_id]['progress'] = 100
                 tasks[task_id]['error'] = error_msg
@@ -451,6 +591,297 @@ def api_thumbnails():
             tasks[task_id]['error'] = str(e)
 
     thread = threading.Thread(target=run_thumbnails, daemon=True)
+    thread.start()
+
+    return jsonify({'task_id': task_id})
+
+
+# ─── API: Image-URL proxy (for edit-mode logo URL previews) ──────────────────
+
+@app.route('/api/fetch-image', methods=['POST'])
+def api_fetch_image():
+    """
+    Download an image from a URL on behalf of the browser and return it
+    as base64 so the frontend can preview it. Used by the edit modal's
+    'Add from URL' flow to confirm the URL actually resolved to an image
+    before the user commits to using it.
+    """
+    import base64 as _b64
+    import urllib.request
+    import urllib.error
+
+    url = (request.json or {}).get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'URL required'}), 400
+    if not (url.startswith('http://') or url.startswith('https://')):
+        return jsonify({'error': 'URL must start with http:// or https://'}), 400
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                # Some image hosts (incl. Google's img serving) block the
+                # default Python UA. Pretend to be a regular browser.
+                'User-Agent': (
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+                'Accept': 'image/*,*/*;q=0.8',
+            },
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            content_type = resp.headers.get('Content-Type', '').lower()
+            data = resp.read(8 * 1024 * 1024)  # 8 MB hard cap
+    except urllib.error.HTTPError as e:
+        return jsonify({'error': f'HTTP {e.code} — {e.reason}'}), 400
+    except urllib.error.URLError as e:
+        return jsonify({'error': f'Could not reach URL: {e.reason}'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    if 'image' not in content_type:
+        return jsonify({'error': f'URL did not return an image (got {content_type or "unknown"})'}), 400
+
+    # Sanity-check that PIL can actually decode it — catches bad MIME labels
+    try:
+        import io as _io
+        from PIL import Image as _PILImage
+        probe = _PILImage.open(_io.BytesIO(data))
+        probe.verify()
+    except Exception as e:
+        return jsonify({'error': f'Image could not be decoded: {e}'}), 400
+
+    # Figure out a clean extension for the data URL
+    ext_map = {
+        'image/png': 'png', 'image/jpeg': 'jpeg', 'image/jpg': 'jpeg',
+        'image/webp': 'webp', 'image/gif': 'gif', 'image/svg+xml': 'svg+xml',
+    }
+    mime = content_type.split(';')[0].strip()
+    ext = ext_map.get(mime, 'png')
+
+    b64 = _b64.b64encode(data).decode('ascii')
+    return jsonify({
+        'data_url': f'data:image/{ext};base64,{b64}',
+        'mime': mime,
+        'size': len(data),
+    })
+
+
+# ─── API: Thumbnail Edit (Layer 1: text-based targeted edits) ────────────────
+
+@app.route('/api/thumbnails/edit', methods=['POST'])
+def api_thumbnails_edit():
+    """
+    Edit an existing generated thumbnail with a text instruction.
+    Reuses the same job-tray flow + concurrency cap as /api/thumbnails.
+    """
+    task_id = str(uuid.uuid4())[:8]
+
+    source_path_rel = (request.form.get('source_path') or '').strip()
+    edit_prompt = (request.form.get('prompt') or '').strip()
+    parent_meta_json = request.form.get('parent_meta', '')
+    try:
+        variations = max(1, min(5, int(request.form.get('variations', '1'))))
+    except (TypeError, ValueError):
+        variations = 1
+
+    # Reference logo files uploaded directly
+    ref_image_paths: list[str] = []
+    if 'logo_files' in request.files:
+        for i, lf in enumerate(request.files.getlist('logo_files')):
+            if lf and lf.filename:
+                # Namespace by task_id to avoid concurrent collisions
+                dest = TMP_DIR / f"logo_{task_id}_{i}_{lf.filename}"
+                lf.save(str(dest))
+                ref_image_paths.append(str(dest))
+
+    # Optional style/layout reference — a single full-frame image that guides
+    # the overall look. Distinct from reference logos (which are exact swaps).
+    style_reference_path: str | None = None
+    if 'style_reference' in request.files:
+        sf = request.files['style_reference']
+        if sf and sf.filename:
+            dest = TMP_DIR / f"styleref_{task_id}_{sf.filename}"
+            sf.save(str(dest))
+            style_reference_path = str(dest)
+
+    # Reference logos by URL (already confirmed via /api/fetch-image preview).
+    # We re-download on the server rather than round-trip the base64 from the
+    # browser, to keep the request payload small.
+    logo_urls_raw = (request.form.get('logo_urls') or '').strip()
+    if logo_urls_raw:
+        import urllib.request
+        import urllib.error
+        for j, u in enumerate(filter(None, (x.strip() for x in logo_urls_raw.split('\n')))):
+            try:
+                req = urllib.request.Request(u, headers={
+                    'User-Agent': (
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/120.0.0.0 Safari/537.36'
+                    ),
+                    'Accept': 'image/*,*/*;q=0.8',
+                })
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    if 'image' not in (resp.headers.get('Content-Type') or '').lower():
+                        continue
+                    blob = resp.read(8 * 1024 * 1024)
+                # Pick an extension from the URL or default to .png
+                suffix = Path(u.split('?')[0]).suffix or '.png'
+                if suffix.lower() not in ('.png', '.jpg', '.jpeg', '.webp', '.gif'):
+                    suffix = '.png'
+                dest = TMP_DIR / f"logo_{task_id}_url{j}{suffix}"
+                dest.write_bytes(blob)
+                ref_image_paths.append(str(dest))
+            except Exception as e:
+                print(f"[{task_id}] Failed to fetch logo URL {u}: {e}")
+
+    if not source_path_rel or not edit_prompt:
+        return jsonify({'error': 'source_path and prompt are required'}), 400
+
+    # Resolve the source path safely — must live under TMP_DIR.
+    source_abs = (TMP_DIR / source_path_rel).resolve()
+    try:
+        source_abs.relative_to(TMP_DIR.resolve())
+    except ValueError:
+        return jsonify({'error': 'Invalid source path'}), 400
+    if not source_abs.exists():
+        return jsonify({'error': 'Source thumbnail not found'}), 404
+
+    # Parse parent meta so we can carry client/title forward into the new meta.
+    parent_meta = {}
+    if parent_meta_json:
+        try:
+            parent_meta = json.loads(parent_meta_json)
+        except Exception:
+            parent_meta = {}
+
+    tasks[task_id] = {
+        'state': 'queued',
+        'progress': 5,
+        'status': 'Queued — waiting for an open slot...',
+        'log': '',
+        'thumbnails': [],
+        'cancelled': False,
+        'proc': None,
+    }
+
+    def run_edit():
+        with thumb_sem:
+            if tasks[task_id].get('cancelled'):
+                tasks[task_id]['state'] = 'cancelled'
+                tasks[task_id]['status'] = 'Cancelled before starting'
+                tasks[task_id]['progress'] = 100
+                return
+            try:
+                tasks[task_id]['state'] = 'running'
+                tasks[task_id]['status'] = 'Editing thumbnail...'
+                tasks[task_id]['progress'] = 15
+
+                cmd = [
+                    PYTHON, "-u", str(EXECUTION_DIR / "recreate_thumbnails.py"),
+                    "--edit", str(source_abs),
+                    "--prompt", edit_prompt,
+                    "--variations", str(variations),
+                ]
+                if ref_image_paths:
+                    cmd += ["--reference-images", ",".join(ref_image_paths)]
+                if style_reference_path:
+                    cmd += ["--style-reference", style_reference_path]
+
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, cwd=str(BASE_DIR)
+                )
+                tasks[task_id]['proc'] = proc
+
+                kill_timer = threading.Timer(300, lambda: proc.kill())
+                kill_timer.daemon = True
+                kill_timer.start()
+
+                log_lines = []
+                run_timestamp = None
+                for line in proc.stdout:
+                    log_lines.append(line.rstrip())
+                    tasks[task_id]['log'] = '\n'.join(log_lines[-30:])
+                    if line.startswith('TIMESTAMP:'):
+                        run_timestamp = line.split(':', 1)[1].strip()
+                        tasks[task_id]['progress'] = 20
+                    elif 'Loading image to edit' in line:
+                        tasks[task_id]['status'] = 'Sending edit to Gemini...'
+                        tasks[task_id]['progress'] = 30
+                    elif line.strip().startswith('--- Variation'):
+                        try:
+                            cur = int(line.split('Variation')[1].split('/')[0].strip())
+                            base = 30
+                            per_var = 60 // variations
+                            tasks[task_id]['progress'] = base + (cur - 1) * per_var
+                            tasks[task_id]['status'] = (
+                                f'Editing variation {cur}/{variations}...'
+                                if variations > 1 else 'Applying edit...'
+                            )
+                        except (ValueError, IndexError):
+                            pass
+                    elif 'Saved:' in line:
+                        tasks[task_id]['progress'] = min(tasks[task_id]['progress'] + 10, 90)
+                    elif 'Error: 429' in line or 'RESOURCE_EXHAUSTED' in line:
+                        tasks[task_id]['status'] = 'API rate limited, retrying...'
+
+                proc.wait()
+                kill_timer.cancel()
+
+                if tasks[task_id].get('cancelled'):
+                    tasks[task_id]['state'] = 'cancelled'
+                    tasks[task_id]['status'] = 'Cancelled'
+                    tasks[task_id]['progress'] = 100
+                    return
+
+                # Find produced edit files. recreate_thumbnails.py saves them as
+                # {YYYYMMDD}/{HHMMSS}_edited_{N}.png (or _edited.png for legacy 1-var)
+                today_dir = TMP_DIR / "thumbnails" / datetime.now().strftime("%Y%m%d")
+                found = []
+                if today_dir.exists() and run_timestamp:
+                    found = sorted(today_dir.glob(f"{run_timestamp}_edited*.png"))
+
+                if found:
+                    rels = [f"thumbnails/{today_dir.name}/{p.name}" for p in found]
+                    tasks[task_id]['thumbnails'] = rels
+                    tasks[task_id]['state'] = 'done'
+                    tasks[task_id]['progress'] = 100
+                    tasks[task_id]['status'] = f'Edit complete ({len(rels)} variation{"s" if len(rels) != 1 else ""})!'
+
+                    # Save metadata: carry parent client/title forward, mark as edit
+                    try:
+                        meta = {
+                            'mode': 'edit',
+                            'edited_from': source_path_rel,
+                            'prompt': edit_prompt,
+                            'video_title': parent_meta.get('video_title', ''),
+                            'client': parent_meta.get('client', ''),
+                            'variations': str(variations),
+                            'source_thumb': source_path_rel,  # show the parent in history
+                        }
+                        meta_path = today_dir / f"{run_timestamp}_meta.json"
+                        with open(meta_path, 'w') as mf:
+                            json.dump(meta, mf)
+                    except Exception:
+                        pass
+                else:
+                    full_log = '\n'.join(log_lines)
+                    # Pull the most relevant error line from the subprocess
+                    # output instead of showing a generic "Check logs" string.
+                    err = _extract_error_from_log(full_log, proc.returncode, default="Edit produced no output.")
+                    tasks[task_id]['state'] = 'error'
+                    tasks[task_id]['progress'] = 100
+                    tasks[task_id]['error'] = err
+                    tasks[task_id]['log'] = '\n'.join(log_lines[-50:])
+
+            except Exception as e:
+                tasks[task_id]['state'] = 'error'
+                tasks[task_id]['error'] = str(e)
+
+    thread = threading.Thread(target=run_edit, daemon=True)
     thread.start()
 
     return jsonify({'task_id': task_id})
@@ -524,6 +955,143 @@ def api_delete_reference(slug, filename):
     return jsonify({'error': 'Not found'}), 404
 
 
+# ─── API: Client-Specific Swipe Files ────────────────────────────────────────
+
+@app.route('/api/clients/<slug>/swipes', methods=['GET'])
+def api_get_client_swipes(slug):
+    swipes_dir = CLIENTS_DIR / slug / "swipe_examples"
+    if not swipes_dir.exists():
+        return jsonify([])
+    exts = {'.jpg', '.jpeg', '.png', '.webp'}
+    swipes = sorted([
+        {'name': f.name, 'url': f'/api/clients/{slug}/swipes/{f.name}'}
+        for f in swipes_dir.iterdir() if f.suffix.lower() in exts
+    ], key=lambda x: x['name'])
+    return jsonify(swipes)
+
+
+@app.route('/api/clients/<slug>/swipes/<filename>')
+def api_serve_client_swipe(slug, filename):
+    file_path = CLIENTS_DIR / slug / "swipe_examples" / filename
+    if file_path.exists():
+        return send_file(str(file_path))
+    return 'Not found', 404
+
+
+@app.route('/api/clients/<slug>/swipes', methods=['POST'])
+def api_upload_client_swipes(slug):
+    swipes_dir = CLIENTS_DIR / slug / "swipe_examples"
+    swipes_dir.mkdir(parents=True, exist_ok=True)
+    uploaded = []
+    files = request.files.getlist('swipes')
+    for f in files:
+        if f.filename:
+            save_path = swipes_dir / f.filename
+            f.save(str(save_path))
+            uploaded.append(f.filename)
+            print(f"[{slug}] Uploaded client swipe: {f.filename}")
+    return jsonify({'uploaded': uploaded, 'count': len(uploaded)})
+
+
+@app.route('/api/clients/<slug>/swipes/<filename>', methods=['DELETE'])
+def api_delete_client_swipe(slug, filename):
+    file_path = CLIENTS_DIR / slug / "swipe_examples" / filename
+    if file_path.exists():
+        file_path.unlink()
+        return jsonify({'deleted': filename})
+    return jsonify({'error': 'Not found'}), 404
+
+
+# ─── API: Import YouTube Channel Thumbnails ─────────────────────────────────
+
+@app.route('/api/clients/<slug>/import-youtube', methods=['POST'])
+def api_import_youtube_thumbnails(slug):
+    """Fetch video thumbnails from a YouTube channel URL using yt-dlp."""
+    data = request.get_json(force=True)
+    channel_url = (data.get('channel_url') or '').strip()
+    if not channel_url:
+        return jsonify({'error': 'channel_url is required'}), 400
+
+    # Normalise: ensure we hit the /videos tab
+    url = channel_url.rstrip('/')
+    if not any(url.endswith(s) for s in ('/videos', '/streams', '/shorts')):
+        url += '/videos'
+
+    import shutil
+    yt_dlp = shutil.which('yt-dlp', path=str(VENV_PYTHON.parent)) or shutil.which('yt-dlp') or 'yt-dlp'
+
+    cmd = [
+        yt_dlp,
+        '--flat-playlist', '--no-download',
+        '--playlist-end', '50',
+        '-J',   # single JSON blob
+        url,
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return jsonify({'error': f'yt-dlp failed: {result.stderr[:300]}'}), 502
+        import json as _json
+        playlist = _json.loads(result.stdout)
+        entries = playlist.get('entries') or []
+        thumbnails = []
+        for e in entries:
+            title = e.get('title') or e.get('id', '')
+            vid_id = e.get('id', '')
+            # Use maxresdefault, fall back to hqdefault
+            thumb_url = f'https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg'
+            thumbnails.append({
+                'id': vid_id,
+                'title': title,
+                'thumbnail': thumb_url,
+            })
+        return jsonify({'channel': playlist.get('channel', playlist.get('title', '')),
+                        'thumbnails': thumbnails})
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'yt-dlp timed out — try a shorter URL'}), 504
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/clients/<slug>/import-youtube/save', methods=['POST'])
+def api_save_youtube_thumbnails(slug):
+    """Download selected YouTube thumbnails into the client's swipe folder."""
+    data = request.get_json(force=True)
+    items = data.get('items') or []  # [{id, title, thumbnail}, ...]
+    if not items:
+        return jsonify({'error': 'No items provided'}), 400
+
+    swipes_dir = CLIENTS_DIR / slug / "swipe_examples"
+    swipes_dir.mkdir(parents=True, exist_ok=True)
+
+    import urllib.request
+    saved = []
+    for item in items:
+        vid_id = item.get('id', '')
+        title = item.get('title', vid_id)
+        # Sanitise title for filename
+        safe_title = "".join(c if c.isalnum() or c in ' -_' else '' for c in title).strip()[:60]
+        fname = f"{safe_title}_{vid_id}.jpg" if safe_title else f"{vid_id}.jpg"
+        dest = swipes_dir / fname
+        if dest.exists():
+            saved.append(fname)
+            continue
+        thumb_url = item.get('thumbnail', f'https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg')
+        try:
+            urllib.request.urlretrieve(thumb_url, str(dest))
+            # Check if maxres returned a tiny placeholder (< 5KB) and fall back
+            if dest.stat().st_size < 5000:
+                dest.unlink()
+                fallback = f'https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg'
+                urllib.request.urlretrieve(fallback, str(dest))
+            saved.append(fname)
+            print(f"[{slug}] Imported YouTube thumb: {fname}")
+        except Exception as exc:
+            print(f"[{slug}] Failed to download {vid_id}: {exc}")
+    return jsonify({'saved': saved, 'count': len(saved)})
+
+
 # ─── API: Progress Polling ────────────────────────────────────────────────────
 
 @app.route('/api/progress/<task_id>')
@@ -531,7 +1099,34 @@ def api_progress(task_id):
     task = tasks.get(task_id)
     if not task:
         return jsonify({'state': 'error', 'error': 'Task not found'}), 404
-    return jsonify(task)
+    # Strip non-JSON-serializable fields (the live Popen handle)
+    return jsonify({k: v for k, v in task.items() if k != 'proc'})
+
+
+@app.route('/api/thumbnails/<task_id>/cancel', methods=['POST'])
+def api_cancel_thumbnail(task_id):
+    task = tasks.get(task_id)
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    if task.get('state') in ('done', 'error', 'cancelled'):
+        return jsonify({'state': task.get('state'), 'noop': True})
+
+    task['cancelled'] = True
+    proc = task.get('proc')
+    if proc and proc.poll() is None:
+        # Job is actively running — kill the subprocess. The worker thread
+        # will see the cancelled flag after proc.wait() returns and mark
+        # state='cancelled'.
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    else:
+        # Job is still queued (no proc yet). The worker checks the cancelled
+        # flag immediately after acquiring the semaphore and exits cleanly.
+        task['status'] = 'Cancelling...'
+
+    return jsonify({'state': 'cancelling'})
 
 
 # ─── API: Thumbnail History ──────────────────────────────────────────────────
@@ -617,9 +1212,15 @@ def api_enhance_prompt():
 
     try:
         cmd = [PYTHON, "-u", "-c", f"""
-import sys, os, requests, io
+import sys, os, io
 sys.path.insert(0, {repr(str(BASE_DIR))})
 os.chdir({repr(str(BASE_DIR))})
+# Suppress all debug output during import/execution
+import logging
+logging.disable(logging.CRITICAL)
+old_stdout = sys.stdout
+sys.stdout = io.StringIO()
+
 from dotenv import load_dotenv
 load_dotenv()
 from PIL import Image
@@ -632,13 +1233,28 @@ if url:
     m = re.search(r'[?&]v=([A-Za-z0-9_-]{{11}})', url)
     if m:
         source = get_youtube_thumbnail(m.group(1))
+
+# Capture only the enhanced prompt
+sys.stdout = old_stdout
 if source:
-    print(enhance_prompt(source, {repr(prompt)}, {repr(video_title)}))
+    result = enhance_prompt(source, {repr(prompt)}, {repr(video_title)})
+    # Print ONLY the result, skip any debug output from enhance_prompt
+    # by redirecting its prints
+    pass
 else:
-    print({repr(prompt)})
+    result = {repr(prompt)}
+
+# Output clean result with delimiter
+print("===ENHANCED===")
+print(result)
 """]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-        enhanced = result.stdout.strip()
+        output = result.stdout.strip()
+        # Extract only the content after our delimiter
+        if '===ENHANCED===' in output:
+            enhanced = output.split('===ENHANCED===', 1)[1].strip()
+        else:
+            enhanced = output
         if not enhanced:
             enhanced = prompt
         return jsonify({'enhanced': enhanced})

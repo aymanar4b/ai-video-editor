@@ -30,3 +30,7 @@ nick files/
 
 # ML models
 models/
+
+# Runtime logs
+nohup.out
+*.log
