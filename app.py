@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,55 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB upload limit
 
 # Task tracking
 tasks = {}
+
+# Persist tasks to disk so a server restart (OOM, redeploy) doesn't leave
+# clients polling with a task_id the new process has never heard of. The
+# subprocess handle itself can't be restored across restarts, so any task
+# found in 'queued' or 'running' state at startup is marked as error with a
+# clear message — far more useful than a bare 404 "Task not found".
+TASKS_FILE = TMP_DIR / "tasks.json"
+_tasks_lock = threading.Lock()
+
+
+def _load_tasks():
+    if not TASKS_FILE.exists():
+        return
+    try:
+        loaded = json.loads(TASKS_FILE.read_text())
+    except Exception as e:
+        print(f"[tasks-persist] failed to load {TASKS_FILE}: {e}")
+        return
+    for tid, t in loaded.items():
+        if t.get('state') in ('queued', 'running'):
+            t['state'] = 'error'
+            t['error'] = 'Server restarted during generation — any completed thumbnails are in History below.'
+            t['progress'] = 100
+        t['proc'] = None
+        tasks[tid] = t
+    print(f"[tasks-persist] restored {len(loaded)} task(s) from disk")
+
+
+def _persist_tasks_loop():
+    while True:
+        time.sleep(2)
+        try:
+            # Copy keys first so we don't fault if another thread mutates
+            # the dict while we build the snapshot.
+            items = list(tasks.items())
+            snapshot = {
+                tid: {k: v for k, v in t.items() if k != 'proc'}
+                for tid, t in items
+            }
+            with _tasks_lock:
+                tmp = TASKS_FILE.with_suffix('.json.tmp')
+                tmp.write_text(json.dumps(snapshot))
+                tmp.replace(TASKS_FILE)
+        except Exception as e:
+            print(f"[tasks-persist] write failed: {e}")
+
+
+_load_tasks()
+threading.Thread(target=_persist_tasks_loop, daemon=True).start()
 
 # Concurrency cap for thumbnail generation. Default is effectively unlimited —
 # every submitted job runs immediately. Set THUMB_CONCURRENCY env var to a small
