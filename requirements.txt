@@ -11,6 +11,7 @@ mediapipe
 google-genai
 openai>=1.40.0
 Pillow
+pillow-heif
 gspread
 google-auth
 google-auth-oauthlib

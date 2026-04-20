@@ -87,6 +87,38 @@ def _persist_tasks_loop():
 _load_tasks()
 threading.Thread(target=_persist_tasks_loop, daemon=True).start()
 
+
+# ─── HEIC upload support ─────────────────────────────────────────────────────
+# iPhone users regularly upload .HEIC photos. Browsers can't render them
+# (outside Safari) and most downstream tools (Gemini, Replicate, OpenCV,
+# older PIL) don't decode them. Transcode to JPEG at upload time so every
+# path below sees a normal image file.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception as _heif_e:
+    print(f"[heic] pillow-heif not available: {_heif_e}")
+
+_HEIC_EXTS = ('.heic', '.heif')
+
+
+def _save_image_upload(fstore, dest_path: Path) -> Path:
+    """Save a Flask FileStorage to disk, transcoding HEIC/HEIF → JPEG so
+    the rest of the pipeline only ever sees formats PIL and browsers can
+    handle. Returns the actual saved path (extension may change)."""
+    from PIL import Image as _PImg, ImageOps as _PImgOps
+    ext = Path(fstore.filename or '').suffix.lower()
+    if ext in _HEIC_EXTS:
+        jpeg_path = dest_path.with_suffix('.jpg')
+        img = _PImg.open(fstore.stream)
+        img = _PImgOps.exif_transpose(img)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img.save(str(jpeg_path), 'JPEG', quality=92)
+        return jpeg_path
+    fstore.save(str(dest_path))
+    return dest_path
+
 # Concurrency cap for thumbnail generation. Default is effectively unlimited —
 # every submitted job runs immediately. Set THUMB_CONCURRENCY env var to a small
 # integer (e.g. 2) if you start hitting Gemini 429s or local resource limits.
@@ -375,8 +407,8 @@ def api_thumbnails():
         for gf in guest_files:
             if gf.filename:
                 gp = TMP_DIR / f"guest_{task_id}_{gf.filename}"
-                gf.save(str(gp))
-                guest_photo_paths.append(str(gp))
+                saved = _save_image_upload(gf, gp)
+                guest_photo_paths.append(str(saved))
 
     # Handle swipe file as source (resolve to a file path)
     source_path = None
@@ -393,8 +425,9 @@ def api_thumbnails():
     if source_path is None and 'image' in request.files:
         f = request.files['image']
         if f.filename:
-            source_path = TMP_DIR / f"thumb_source_{task_id}_{f.filename}"
-            f.save(str(source_path))
+            source_path = _save_image_upload(
+                f, TMP_DIR / f"thumb_source_{task_id}_{f.filename}"
+            )
             print(f"[{task_id}] Uploaded source image saved to {source_path} "
                   f"({source_path.stat().st_size} bytes)")
         else:
@@ -407,8 +440,9 @@ def api_thumbnails():
     if 'image2' in request.files:
         f2 = request.files['image2']
         if f2.filename:
-            source_path2 = TMP_DIR / f"thumb_source2_{task_id}_{f2.filename}"
-            f2.save(str(source_path2))
+            source_path2 = _save_image_upload(
+                f2, TMP_DIR / f"thumb_source2_{task_id}_{f2.filename}"
+            )
 
     tasks[task_id] = {
         'state': 'queued',
@@ -800,8 +834,8 @@ def api_thumbnails_edit():
             if lf and lf.filename:
                 # Namespace by task_id to avoid concurrent collisions
                 dest = TMP_DIR / f"logo_{task_id}_{i}_{lf.filename}"
-                lf.save(str(dest))
-                ref_image_paths.append(str(dest))
+                saved = _save_image_upload(lf, dest)
+                ref_image_paths.append(str(saved))
 
     # Optional style/layout reference — a single full-frame image that guides
     # the overall look. Distinct from reference logos (which are exact swaps).
@@ -810,8 +844,8 @@ def api_thumbnails_edit():
         sf = request.files['style_reference']
         if sf and sf.filename:
             dest = TMP_DIR / f"styleref_{task_id}_{sf.filename}"
-            sf.save(str(dest))
-            style_reference_path = str(dest)
+            saved = _save_image_upload(sf, dest)
+            style_reference_path = str(saved)
 
     # Reference logos by URL (already confirmed via /api/fetch-image preview).
     # We re-download on the server rather than round-trip the base64 from the
@@ -1047,9 +1081,9 @@ def api_upload_references(slug):
     for f in files:
         if f.filename:
             save_path = refs_dir / f.filename
-            f.save(str(save_path))
-            uploaded.append(f.filename)
-            print(f"[{slug}] Uploaded reference: {f.filename}")
+            saved = _save_image_upload(f, save_path)
+            uploaded.append(saved.name)
+            print(f"[{slug}] Uploaded reference: {saved.name}")
     return jsonify({'uploaded': uploaded, 'count': len(uploaded)})
 
 
@@ -1094,9 +1128,9 @@ def api_upload_client_swipes(slug):
     for f in files:
         if f.filename:
             save_path = swipes_dir / f.filename
-            f.save(str(save_path))
-            uploaded.append(f.filename)
-            print(f"[{slug}] Uploaded client swipe: {f.filename}")
+            saved = _save_image_upload(f, save_path)
+            uploaded.append(saved.name)
+            print(f"[{slug}] Uploaded client swipe: {saved.name}")
     return jsonify({'uploaded': uploaded, 'count': len(uploaded)})
 
 
